@@ -8,9 +8,10 @@ import time
 import traceback
 from datetime import datetime
 from itertools import count
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtGui import QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -225,17 +226,35 @@ class AutomationWorker(QThread):
 
         next_btn = page.locator(config.SELECTORS["next_page_button"])
         try:
-            if next_btn.count() > 0 and next_btn.first.is_enabled():
-                self._log("[INFO] Next page…")
-                next_btn.first.click(timeout=self.settings["per_record_timeout"])
-                page.wait_for_selector(
-                    config.SELECTORS["review_button"],
-                    timeout=self.settings["list_refresh_timeout"],
-                    state="visible",
-                )
-                return True
+            if next_btn.count() > 0:
+                btn_first = next_btn.first
+                is_visible = btn_first.is_visible()
+                self._log(f"[DEBUG] Next button: visible={is_visible}, enabled={btn_first.is_enabled()}")
+                if is_visible:
+                    self._log("[INFO] Next page…")
+                    btn_first.click(timeout=self.settings["per_record_timeout"])
+                    page.wait_for_timeout(2000)
+                    page.wait_for_selector(
+                        config.SELECTORS["review_button"],
+                        timeout=self.settings["list_refresh_timeout"],
+                        state="visible",
+                    )
+                    return True
         except Exception as e:
             self._log(f"[INFO] Pagination failed: {e}")
+            try:
+                btns = page.locator("button, a").all()
+                texts = [b.inner_text().strip() for b in btns if b.inner_text().strip()]
+                self._log(f"[DEBUG] Buttons/links on page: {texts}")
+            except Exception:
+                pass
+            html_file = config.LOGS_DIR / "page_dump_pagination_failed.html"
+            try:
+                with open(html_file, "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                self._log(f"[DEBUG] Page HTML saved: {html_file}")
+            except Exception:
+                pass
         return False
 
     def _screenshot(self, page: Page, label: str) -> str:
@@ -282,8 +301,7 @@ class AutomationWorker(QThread):
 
         btns = page.locator(config.SELECTORS["review_button"])
         n = btns.count()
-        if index >= n:
-            return "no_more_records"
+        self._log(f"[{index}] {n} REVIEW button(s) visible.")
 
         if self.settings["dry_run"]:
             self._log(f"[{index}] DRY RUN — REVIEW only…")
@@ -300,7 +318,7 @@ class AutomationWorker(QThread):
         page.locator(config.SELECTORS["confirm_button"]).first.click(timeout=self.settings["per_record_timeout"])
         page.locator(config.SELECTORS["ok_button"]).first.click(timeout=self.settings["per_record_timeout"])
         page.wait_for_url("**/claim-application-list*", timeout=self.settings["per_record_timeout"])
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(2500)
         self._log_record(writer, index, "approved", "")
         return "ok"
 
@@ -406,6 +424,12 @@ class ClaimApproverGUI(QMainWindow):
         self.setWindowTitle("FasloFasal")
         self.setMinimumSize(420, 560)
         self.resize(440, 600)
+
+        # Set icon
+        icon_path = Path(__file__).parent / "assets" / "faslofasal.png"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+
         self._center()
 
         root = QWidget()

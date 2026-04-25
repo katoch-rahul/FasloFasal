@@ -63,17 +63,37 @@ def _wait_for_review_or_paginate(page: Page) -> bool:
     # Try clicking a "Next" pagination button if one exists.
     next_btn = page.locator(config.SELECTORS["next_page_button"])
     try:
-        if next_btn.count() > 0 and next_btn.first.is_enabled():
-            print("[INFO] No REVIEW on current page; clicking Next page...")
-            next_btn.first.click(timeout=config.PER_RECORD_TIMEOUT_MS)
-            page.wait_for_selector(
-                config.SELECTORS["review_button"],
-                timeout=config.LIST_REFRESH_TIMEOUT_MS,
-                state="visible",
-            )
-            return True
+        if next_btn.count() > 0:
+            btn_first = next_btn.first
+            is_visible = btn_first.is_visible()
+            print(f"[DEBUG] Next button found: visible={is_visible}, enabled={btn_first.is_enabled()}")
+            if is_visible:
+                print("[INFO] No REVIEW on current page; clicking Next page...")
+                btn_first.click(timeout=config.PER_RECORD_TIMEOUT_MS)
+                page.wait_for_timeout(2000)
+                page.wait_for_selector(
+                    config.SELECTORS["review_button"],
+                    timeout=config.LIST_REFRESH_TIMEOUT_MS,
+                    state="visible",
+                )
+                return True
     except Exception as e:
         print(f"[INFO] Pagination attempt failed: {e}")
+        # Print all button texts to help identify the correct Next button selector
+        try:
+            btns = page.locator("button, a").all()
+            texts = [b.inner_text().strip() for b in btns if b.inner_text().strip()]
+            print(f"[DEBUG] Buttons/links on page: {texts}")
+        except:
+            pass
+        # Dump HTML for debugging
+        html_file = config.LOGS_DIR / "page_dump_pagination_failed.html"
+        try:
+            with open(html_file, "w", encoding="utf-8") as f:
+                f.write(page.content())
+            print(f"[DEBUG] Page HTML saved to: {html_file}")
+        except:
+            pass
 
     return False
 
@@ -90,9 +110,6 @@ def process_one_record(page: Page, log_writer, index: int) -> str:
     review_buttons = page.locator(config.SELECTORS["review_button"])
     count = review_buttons.count()
     print(f"[{index}] {count} REVIEW button(s) visible.")
-
-    if index >= count:
-        return "no_more_records"
 
     if config.DRY_RUN:
         print(f"[{index}] DRY_RUN: Clicking REVIEW button {index} (without actually approving)...")
@@ -118,7 +135,7 @@ def process_one_record(page: Page, log_writer, index: int) -> str:
 
     page.wait_for_url("**/claim-application-list*", timeout=config.PER_RECORD_TIMEOUT_MS)
     # Give the table a moment to re-render after the approval round-trip.
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(2500)
     _log(log_writer, index, "approved", "")
     return "ok"
 

@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 browser-profile/
 logs/
+build/
+dist/
 .vscode/
 .idea/
