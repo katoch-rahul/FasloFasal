@@ -1,3 +1,7 @@
 .venv\Scripts\python.exe approve_claims.py
 
 - run in project directory. 
+
+
+cd c:/Projects/faslofasal/FasloFasal && source c:/Projects/faslofasal/.venv/Scripts/activate && python approve_claims.py
+-----------when venv outside parent 
