@@ -118,9 +118,44 @@ QSpinBox, QDoubleSpinBox {
     border-radius: 4px;
     background-color: #1e1e2e;
     color: #cdd6f4;
-    min-width: 70px;
+    min-width: 90px;
+    min-height: 24px;
 }
 QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #cba6f7; }
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 18px;
+    border-left: 1px solid #45475a;
+    border-bottom: 1px solid #45475a;
+    border-top-right-radius: 4px;
+    background-color: #313244;
+}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover { background-color: #45475a; }
+QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed { background-color: #585b70; }
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: 18px;
+    border-left: 1px solid #45475a;
+    border-bottom-right-radius: 4px;
+    background-color: #313244;
+}
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover { background-color: #45475a; }
+QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed { background-color: #585b70; }
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid #cdd6f4;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #cdd6f4;
+}
+
 
 QTextEdit {
     background-color: #11111b;
@@ -147,7 +182,7 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { background: none;
 
 PHASES = {
     "idle":    ("●", "#f9e2af", "Ready",       "Configure below, then press Start"),
-    "waiting": ("●", "#89b4fa", "Waiting…",    "Log in → select PRI → click PROCEED"),
+    "waiting": ("●", "#89b4fa", "Waiting…",    "Log in → select claim type → click PROCEED"),
     "running": ("●", "#a6e3a1", "Running",     "Processing claims automatically"),
     "paused":  ("●", "#f9e2af", "Paused",      "Click Resume to continue"),
     "done":    ("✓", "#a6e3a1", "Finished",    "See log for summary"),
@@ -210,7 +245,8 @@ class AutomationWorker(QThread):
             self.phase_signal.emit("running")
             page.wait_for_timeout(1500)
         except PlaywrightTimeoutError:
-            self._log("[ERROR] Timed out — did you select PRI and click PROCEED?")
+            ct = self.settings.get("claim_type", "PRI/IS")
+            self._log(f"[ERROR] Timed out — did you select {ct} and click PROCEED?")
             raise
 
     def _wait_for_review_or_paginate(self, page: Page) -> bool:
@@ -442,7 +478,7 @@ class ClaimApproverGUI(QMainWindow):
         header = QHBoxLayout()
         title = QLabel("FasloFasal")
         title.setObjectName("title")
-        sub = QLabel("Claim Approver")
+        sub = QLabel("Claim Verifier")
         sub.setObjectName("subtitle")
         sub.setAlignment(Qt.AlignBottom)
         header.addWidget(title)
@@ -510,12 +546,25 @@ class ClaimApproverGUI(QMainWindow):
         v.setContentsMargins(10, 10, 10, 10)
         v.setSpacing(8)
 
+        # Capability banner
+        banner = QLabel("Works with both <b>IS</b> and <b>PRI</b> claim verifications.")
+        banner.setTextFormat(Qt.RichText)
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "color:#cba6f7; font-size:9pt; font-weight:bold;"
+            "padding:6px 8px; background:#2a1f3d; border-radius:4px;"
+            "border-left:3px solid #cba6f7;"
+        )
+        v.addWidget(banner)
+
         steps = [
-            ("1", "Press <b>Start</b> — a Chrome window opens."),
-            ("2", "Log in to <b>fasalrin.gov.in</b> if asked."),
-            ("3", "Pick <b>PRI</b> from the Claim Type dropdown."),
-            ("4", "Click <b>PROCEED</b> — wait for the table."),
-            ("5", "Sit back — the tool processes each row."),
+            ("1", "Press <b>Start</b> — a browser window opens at the portal."),
+            ("2", "Log in to <b>fasalrin.gov.in</b> if prompted."),
+            ("3", "Select <b>IS</b> or <b>PRI</b> from the Claim Type dropdown."),
+            ("4", "Set Financial Year, Claim Status, Branch/PACS as needed."),
+            ("5", "Click <b>PROCEED</b> — wait for the claims table to appear."),
+            ("6", "The tool auto-processes every row: REVIEW → Approve → Confirm → OK."),
+            ("7", "To verify the other claim type, press <b>Start</b> again and repeat."),
         ]
         for num, txt in steps:
             row = QHBoxLayout()
@@ -531,7 +580,7 @@ class ClaimApproverGUI(QMainWindow):
             v.addLayout(row)
 
         v.addStretch()
-        tip = QLabel("💡 Tip: Keep <b>Dry Run</b> on for your first run to test safely.")
+        tip = QLabel("💡 Keep <b>Dry Run</b> on for your first run — it clicks REVIEW only, makes no approvals.")
         tip.setTextFormat(Qt.RichText)
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#a6adc8; font-size:8pt; padding:6px; background:#1e1e2e; border-radius:4px;")
@@ -560,7 +609,7 @@ class ClaimApproverGUI(QMainWindow):
 
         self._max_records_sb   = self._make_sb(1, 1000, config.MAX_RECORDS_PER_RUN)
         self._timeout_sec_sb   = self._make_sb(5, 120, config.PER_RECORD_TIMEOUT_MS // 1000)
-        self._delay_sb         = self._make_dsb(0.5, 10.0, config.DELAY_BETWEEN_RECORDS_SEC)
+        self._delay_sb         = self._make_dsb(0.1, 10.0, config.DELAY_BETWEEN_RECORDS_SEC)
         self._manual_timeout_sb = self._make_sb(30, 600, config.MANUAL_SETUP_TIMEOUT_SEC)
 
         form.addRow(self._lbl("Max records:"),    self._max_records_sb)
@@ -625,7 +674,7 @@ class ClaimApproverGUI(QMainWindow):
         sb = QSpinBox(); sb.setRange(lo, hi); sb.setValue(val); return sb
 
     def _make_dsb(self, lo, hi, val):
-        sb = QDoubleSpinBox(); sb.setRange(lo, hi); sb.setValue(val); sb.setSingleStep(0.5); return sb
+        sb = QDoubleSpinBox(); sb.setRange(lo, hi); sb.setValue(val); sb.setSingleStep(0.1); sb.setDecimals(2); return sb
 
     def _lbl(self, text: str) -> QLabel:
         lbl = QLabel(text)
