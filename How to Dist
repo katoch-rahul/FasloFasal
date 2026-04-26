@@ -1,0 +1,35 @@
+# Distribute FasloFasal
+
+## One Command (Copy & Paste)
+
+```bash
+cd /c/Projects/faslofasal && rm -rf FasloFasal/dist FasloFasal/build && /c/Projects/faslofasal/.venv/Scripts/python -m PyInstaller FasloFasal/FasloFasal.spec && mv FasloFasal/dist/FasloFasal dist/ && /c/Projects/faslofasal/.venv/Scripts/python -c "import shutil; from pathlib import Path; z=Path('FasloFasal-v1.0.1-windows.zip'); z.exists() and z.unlink(); shutil.make_archive('FasloFasal-v1.0.1-windows', 'zip', 'dist', 'FasloFasal'); print('Done: FasloFasal-v1.0.1-windows.zip')"
+```
+
+## Step by Step
+
+Clean:
+```bash
+cd /c/Projects/faslofasal && rm -rf FasloFasal/dist FasloFasal/build
+```
+
+Build:
+```bash
+/c/Projects/faslofasal/.venv/Scripts/python -m PyInstaller FasloFasal/FasloFasal.spec
+```
+
+Package:
+```bash
+mv FasloFasal/dist/FasloFasal dist/
+```
+
+Zip:
+```bash
+cd /c/Projects/faslofasal && /c/Projects/faslofasal/.venv/Scripts/python -c "import shutil; from pathlib import Path; z=Path('FasloFasal-v1.0.1-windows.zip'); z.exists() and z.unlink(); shutil.make_archive('FasloFasal-v1.0.1-windows', 'zip', 'dist', 'FasloFasal')"
+```
+
+## Result
+
+File: `FasloFasal-v1.0.1-windows.zip`
+- Includes: FasloFasal.exe + _internal/
+- Ready to share with colleagues

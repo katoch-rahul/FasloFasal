@@ -2,6 +2,9 @@
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
+# Version info
+VERSION = "1.0.1"
+
 # Playwright Python package
 datas, binaries, hiddenimports = [], [], []
 tmp = collect_all('playwright')

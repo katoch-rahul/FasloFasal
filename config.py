@@ -5,6 +5,8 @@ Tweak selectors and timing here without touching approve_claims.py.
 
 from pathlib import Path
 
+VERSION = "1.0.1"
+
 PROJECT_DIR = Path(__file__).parent
 BROWSER_PROFILE_DIR = PROJECT_DIR / "browser-profile"
 LOGS_DIR = PROJECT_DIR / "logs"
