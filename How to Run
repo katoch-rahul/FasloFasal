@@ -1,3 +1,36 @@
-cd c:/Projects/faslofasal/FasloFasal 
-&&  
-c:/Projects/faslofasal/.venv/Scripts/activate && python gui.py
+# FasloFasal Claim Verification Automation
+#
+# WHAT THIS APPLICATION DOES:
+# This tool automates the repetitive process of verifying and approving agricultural insurance claims
+# on the government portal fasalrin.gov.in. It handles the "REVIEW → Approve → Confirm → OK" workflow
+# for each claim record, significantly reducing manual effort.
+#
+# KEY FEATURES:
+# - Dry Run mode: Test the automation without making actual changes (safe for first-time use)
+# - Live mode: Actually processes and approves claims (use after verifying Dry Run works correctly)
+# - Configurable settings: Adjust timing, batch sizes, and timeouts as needed
+# - Detailed logging: Records all actions for audit and troubleshooting
+#
+# HOW TO USE THIS FILE:
+# This file contains the exact commands needed to launch the application.
+#
+# STEP-BY-STEP INSTRUCTIONS:
+# 1. Open a terminal/command prompt in this project folder
+# 2. Run the commands below in sequence
+#
+# TO LAUNCH THE APPLICATION:
+cd /c/Projects/faslofasal/FasloFasal
+/c/Projects/faslofasal/.venv/Scripts/python.exe gui.py
+#
+# AFTER LAUNCHING:
+# - A graphical user interface will appear
+# - Review the "Guide" tab for detailed usage instructions
+# - Start with "Dry Run" enabled (recommended for first use)
+# - Configure settings as needed in the "Settings" tab
+# - Press "Start" to begin the automation process
+#
+# IMPORTANT NOTES:
+# - Always verify Dry Run works correctly before switching to Live mode
+# - The application requires manual login to the government portal on first run
+# - Browser profiles are saved to avoid repeated logins
+# - Check the "Log" tab during operation to monitor progress
