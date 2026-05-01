@@ -12,7 +12,10 @@ BROWSER_PROFILE_DIR = PROJECT_DIR / "browser-profile"
 LOGS_DIR = PROJECT_DIR / "logs"
 
 PORTAL_BASE = "https://fasalrin.gov.in"
-LIST_URL = f"{PORTAL_BASE}/claim-application-list"
+DASHBOARD_URL = f"{PORTAL_BASE}/dashboard"
+CLAIM_LIST_URL = f"{PORTAL_BASE}/claim-application-list"
+LOAN_LIST_URL = f"{PORTAL_BASE}/loan-application-list"
+LIST_URL = DASHBOARD_URL  # Default entry point
 
 DRY_RUN = False
 MAX_RECORDS_PER_RUN = 50

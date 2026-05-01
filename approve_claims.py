@@ -1,8 +1,8 @@
-"""Automate PRI Claim Verification on fasalrin.gov.in.
+"""Automate Claim and Loan Application Verification on fasalrin.gov.in.
 
 Workflow:
-  1. Navigate to claim-application-list
-  2. Select "PRI" from Claim type dropdown
+  1. Navigate to claim-application-list or loan-application-list
+  2. Select claim type (PRI/IS) or skip for loan applications
   3. Click PROCEED
   4. For each record: Click REVIEW -> Approve -> Confirm -> OK
 """
@@ -133,7 +133,8 @@ def process_one_record(page: Page, log_writer, index: int) -> str:
         timeout=config.PER_RECORD_TIMEOUT_MS
     )
 
-    page.wait_for_url("**/claim-application-list*", timeout=config.PER_RECORD_TIMEOUT_MS)
+    # Wait for either claim or loan application list URL
+    page.wait_for_url("**/*application-list*", timeout=config.PER_RECORD_TIMEOUT_MS)
     # Give the table a moment to re-render after the approval round-trip.
     page.wait_for_timeout(2500)
     _log(log_writer, index, "approved", "")

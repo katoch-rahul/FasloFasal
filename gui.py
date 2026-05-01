@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QFrame,
     QFormLayout,
+    QDialog,
+    QScrollArea,
 )
 from playwright.sync_api import (
     Page,
@@ -181,21 +183,117 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { background: none;
 """
 
 PHASES = {
-    "idle":    ("●", "#f9e2af", "Ready",       "Configure below, then press Start"),
-    "waiting": ("●", "#89b4fa", "Waiting…",    "Log in → select claim type → click PROCEED"),
-    "running": ("●", "#a6e3a1", "Running",     "Processing claims automatically"),
-    "paused":  ("●", "#f9e2af", "Paused",      "Click Resume to continue"),
-    "done":    ("✓", "#a6e3a1", "Finished",    "See log for summary"),
-    "error":   ("✕", "#f38ba8", "Error",       "Check log for details"),
+    "idle":    ("●", "#f9e2af", "Ready",       "Click ▶ Start to begin"),
+    "waiting": ("●", "#89b4fa", "Waiting for you…", "Open the page and click PROCEED on the website"),
+    "running": ("●", "#a6e3a1", "Working…",    "Tool is approving records — please don't touch"),
+    "paused":  ("●", "#f9e2af", "Paused",      "Click Resume when you're ready"),
+    "done":    ("✓", "#a6e3a1", "Finished!",   "All done. Check the Log tab for details"),
+    "error":   ("✕", "#f38ba8", "Something went wrong", "Open the Log tab to see what happened"),
 }
+
+
+# ── Module Confirmation Dialog ────────────────────────────────────────────────
+class ModuleConfirmationDialog(QDialog):
+    def __init__(self, module_name: str, record_count: int = 0, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Confirm Before Starting")
+        self.setMinimumWidth(440)
+        self.setStyleSheet(APP_STYLE)
+        # Force this dialog to appear on top of all windows (including the browser)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowStaysOnTopHint
+            | Qt.CustomizeWindowHint
+            | Qt.WindowTitleHint
+            | Qt.WindowCloseButtonHint
+        )
+        self.setModal(True)
+        self._build_ui(module_name, record_count)
+        self.confirmed = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Bring to front and grab focus when shown
+        self.raise_()
+        self.activateWindow()
+        QApplication.alert(self, 0)            # flash taskbar to grab attention
+
+    def _build_ui(self, module_name: str, record_count: int):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 18, 18, 18)
+        v.setSpacing(12)
+
+        # Title
+        title = QLabel("Please check before starting")
+        title.setStyleSheet("font-size:13pt; font-weight:bold; color:#cba6f7;")
+        v.addWidget(title)
+
+        # Friendly explainer
+        explainer = QLabel(
+            "I am about to start clicking <b>REVIEW → Approve → Confirm → OK</b> "
+            "on every record below.<br/><br/>"
+            "Please make sure you opened the right page before saying Yes."
+        )
+        explainer.setTextFormat(Qt.RichText)
+        explainer.setWordWrap(True)
+        explainer.setStyleSheet("color:#cdd6f4; font-size:10pt;")
+        v.addWidget(explainer)
+
+        # Module info — large and clear
+        info = QLabel(
+            f"<div style='font-size:9pt; color:#a6adc8;'>You are on this page:</div>"
+            f"<div style='color:#a6e3a1; font-size:13pt; font-weight:bold;'>{module_name}</div>"
+        )
+        info.setTextFormat(Qt.RichText)
+        info.setWordWrap(True)
+        info.setStyleSheet("padding:12px; background:#2a1f3d; border-radius:6px; border-left:4px solid #a6e3a1;")
+        v.addWidget(info)
+
+        if record_count > 0:
+            count_lbl = QLabel(
+                f"<div style='font-size:9pt; color:#a6adc8;'>Records visible on screen:</div>"
+                f"<div style='color:#89b4fa; font-size:12pt; font-weight:bold;'>{record_count}</div>"
+            )
+            count_lbl.setTextFormat(Qt.RichText)
+            count_lbl.setStyleSheet("padding:8px; background:#1e1e2e; border-radius:6px;")
+            v.addWidget(count_lbl)
+
+        # Warning
+        warn = QLabel("⚠  If this is the wrong page, click <b>NO, GO BACK</b> and start again.")
+        warn.setTextFormat(Qt.RichText)
+        warn.setWordWrap(True)
+        warn.setStyleSheet("color:#f9e2af; font-size:10pt; font-weight:bold; padding:6px;")
+        v.addWidget(warn)
+
+        v.addSpacing(8)
+
+        # Buttons — large and clear
+        h = QHBoxLayout()
+        cancel = QPushButton("✕  NO, GO BACK")
+        cancel.setObjectName("stopBtn")
+        cancel.setFixedHeight(44)
+        cancel.clicked.connect(self.reject)
+        confirm = QPushButton("✓  YES, START")
+        confirm.setObjectName("startBtn")
+        confirm.setFixedHeight(44)
+        confirm.setDefault(True)
+        confirm.clicked.connect(self._on_confirm)
+        h.addWidget(cancel)
+        h.addWidget(confirm)
+        v.addLayout(h)
+
+    def _on_confirm(self):
+        self.confirmed = True
+        self.accept()
 
 
 # ── Worker thread ─────────────────────────────────────────────────────────────
 class AutomationWorker(QThread):
-    log_signal      = Signal(str)
-    phase_signal    = Signal(str)
-    progress_signal = Signal(int, int)        # approved, failed
-    finished_signal = Signal(int, int)
+    log_signal           = Signal(str)
+    phase_signal         = Signal(str)
+    progress_signal      = Signal(int, int)        # approved, failed
+    finished_signal      = Signal(int, int)
+    module_detected      = Signal(str, int)        # module_name, record_count
 
     def __init__(self, settings: dict):
         super().__init__()
@@ -203,18 +301,29 @@ class AutomationWorker(QThread):
         self.is_running  = True
         self._pause_evt  = threading.Event()
         self._pause_evt.set()                  # set = run, clear = paused
+        self._confirm_evt = threading.Event()
+        self._confirm_evt.clear()              # clear = waiting for confirmation
         self.approved    = 0
         self.failed      = 0
+        self.module_name = ""
 
     def stop(self):
         self.is_running = False
         self._pause_evt.set()                  # release if paused
+        self._confirm_evt.set()                # release if waiting for confirmation
 
     def pause(self):
         self._pause_evt.clear()
 
     def resume(self):
         self._pause_evt.set()
+
+    def confirm_module(self):
+        self._confirm_evt.set()
+
+    def reject_module(self):
+        self.is_running = False
+        self._confirm_evt.set()
 
     def is_paused(self) -> bool:
         return not self._pause_evt.is_set()
@@ -228,25 +337,60 @@ class AutomationWorker(QThread):
                 self.phase_signal.emit("running")
                 self.log_signal.emit("[INFO] Resumed.")
 
+    def _wait_for_module_confirmation(self):
+        self.log_signal.emit("[INFO] Waiting for user to confirm module…")
+        self._confirm_evt.wait()
+        if not self.is_running:
+            self._log("[INFO] Module verification cancelled by user.")
+            raise RuntimeError("Module verification cancelled")
+
     # ── helpers ────────────────────────────────────────────────────────────
     def _log(self, msg: str):
         self.log_signal.emit(msg)
 
+    def _detect_module(self, page: Page) -> str:
+        """Detect which module is being verified based on page URL and content."""
+        url = page.url
+        if "loan-application-list" in url:
+            return "LOAN APPLICATION VERIFICATION"
+        elif "claim-application-list" in url:
+            return "CLAIM VERIFICATION"
+        return "UNKNOWN MODULE"
+
+    def _get_record_count(self, page: Page) -> int:
+        """Get the number of records visible in the table."""
+        try:
+            review_buttons = page.locator(config.SELECTORS["review_button"])
+            return review_buttons.count()
+        except Exception:
+            return 0
+
     def _wait_for_login_and_table(self, page: Page) -> None:
         page.goto(config.LIST_URL, wait_until="domcontentloaded")
         self.phase_signal.emit("waiting")
-        self._log("[INFO] Browser opened. Complete steps 2–4 in the browser.")
+        self._log("[INFO] Browser opened. Select a module and click PROCEED.")
         try:
             page.wait_for_selector(
                 config.SELECTORS["review_button"],
                 timeout=self.settings["manual_timeout"] * 1000,
             )
-            self._log("[OK] Table detected — starting.")
-            self.phase_signal.emit("running")
+            self._log("[OK] Table detected. Waiting for confirmation…")
             page.wait_for_timeout(1500)
+
+            # Detect module and get record count
+            module = self._detect_module(page)
+            count = self._get_record_count(page)
+            self.module_name = module
+            self._log(f"[INFO] Detected module: {module} (Records: {count})")
+            self.module_detected.emit(module, count)
+
+            # Wait for user confirmation
+            self._wait_for_module_confirmation()
+
+            self._log("[OK] Starting automation…")
+            self.phase_signal.emit("running")
         except PlaywrightTimeoutError:
-            ct = self.settings.get("claim_type", "PRI/IS")
-            self._log(f"[ERROR] Timed out — did you select {ct} and click PROCEED?")
+            self._log("[ERROR] Timed out — did you select a module and click PROCEED?")
             raise
 
     def _wait_for_review_or_paginate(self, page: Page) -> bool:
@@ -353,7 +497,8 @@ class AutomationWorker(QThread):
         page.locator(config.SELECTORS["approve_button"]).first.click(timeout=self.settings["per_record_timeout"])
         page.locator(config.SELECTORS["confirm_button"]).first.click(timeout=self.settings["per_record_timeout"])
         page.locator(config.SELECTORS["ok_button"]).first.click(timeout=self.settings["per_record_timeout"])
-        page.wait_for_url("**/claim-application-list*", timeout=self.settings["per_record_timeout"])
+        # Wait for either claim or loan application list URL
+        page.wait_for_url("**/*application-list*", timeout=self.settings["per_record_timeout"])
         page.wait_for_timeout(2500)
         self._log_record(writer, index, "approved", "")
         return "ok"
@@ -458,8 +603,8 @@ class ClaimApproverGUI(QMainWindow):
     # ── UI ─────────────────────────────────────────────────────────────────
     def _build_ui(self):
         self.setWindowTitle("FasloFasal")
-        self.setMinimumSize(420, 560)
-        self.resize(440, 600)
+        self.setMinimumSize(460, 620)
+        self.resize(500, 720)
 
         # Set icon
         icon_path = Path(__file__).parent / "assets" / "faslofasal.png"
@@ -478,7 +623,7 @@ class ClaimApproverGUI(QMainWindow):
         header = QHBoxLayout()
         title = QLabel("FasloFasal")
         title.setObjectName("title")
-        sub = QLabel("Claim Verifier")
+        sub = QLabel("Claim & Loan Verifier")
         sub.setObjectName("subtitle")
         sub.setAlignment(Qt.AlignBottom)
         header.addWidget(title)
@@ -534,58 +679,180 @@ class ClaimApproverGUI(QMainWindow):
         f.setObjectName("liveWarn")
         h = QHBoxLayout(f)
         h.setContentsMargins(8, 4, 8, 4)
-        lbl = QLabel("⚠  LIVE MODE — claims will be approved")
+        lbl = QLabel("⚠  LIVE MODE — records will be approved for real!")
         lbl.setObjectName("liveWarnText")
         h.addWidget(lbl)
         f.setVisible(False)
         return f
 
     def _build_guide_tab(self) -> QWidget:
+        # Wrap in a scroll area — guide is long and readable text matters more than fitting on screen
+        outer = QWidget()
+        outer_v = QVBoxLayout(outer)
+        outer_v.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
         w = QWidget()
         v = QVBoxLayout(w)
-        v.setContentsMargins(10, 10, 10, 10)
-        v.setSpacing(8)
+        v.setContentsMargins(14, 14, 14, 14)
+        v.setSpacing(12)
 
-        # Capability banner
-        banner = QLabel("Works with both <b>IS</b> and <b>PRI</b> claim verifications.")
-        banner.setTextFormat(Qt.RichText)
-        banner.setWordWrap(True)
-        banner.setStyleSheet(
-            "color:#cba6f7; font-size:9pt; font-weight:bold;"
-            "padding:6px 8px; background:#2a1f3d; border-radius:4px;"
-            "border-left:3px solid #cba6f7;"
+        # ── What this tool does ────────────────────────────────────────
+        what = QLabel(
+            "<div style='font-size:13pt; font-weight:bold; color:#cba6f7;'>"
+            "What does this tool do?</div>"
+            "<div style='font-size:10pt; color:#cdd6f4; margin-top:6px;'>"
+            "It clicks the same buttons you click on the website — "
+            "<b>REVIEW</b>, then <b>Approve</b>, then <b>Confirm</b>, then <b>OK</b> — "
+            "for every record, one by one, until all are done."
+            "</div>"
         )
-        v.addWidget(banner)
+        what.setTextFormat(Qt.RichText)
+        what.setWordWrap(True)
+        what.setStyleSheet("padding:12px; background:#2a1f3d; border-radius:6px; border-left:4px solid #cba6f7;")
+        v.addWidget(what)
+
+        # ── Works with ────────────────────────────────────────────────
+        works = QLabel(
+            "<div style='font-size:11pt; font-weight:bold; color:#a6e3a1;'>"
+            "✓ Works on these pages:</div>"
+            "<div style='font-size:10pt; color:#cdd6f4; margin-top:4px; line-height:1.5;'>"
+            "&nbsp;&nbsp;• Loan Application Verification<br/>"
+            "&nbsp;&nbsp;• PRI Claim Verification<br/>"
+            "&nbsp;&nbsp;• IS Claim Verification"
+            "</div>"
+        )
+        works.setTextFormat(Qt.RichText)
+        works.setWordWrap(True)
+        works.setStyleSheet("padding:12px; background:#1e1e2e; border-radius:6px;")
+        v.addWidget(works)
+
+        # ── How to use it ─────────────────────────────────────────────
+        how_title = QLabel("<b style='font-size:13pt; color:#cba6f7;'>How to use it — step by step</b>")
+        how_title.setTextFormat(Qt.RichText)
+        v.addWidget(how_title)
 
         steps = [
-            ("1", "Press <b>Start</b> — a browser window opens at the portal."),
-            ("2", "Log in to <b>fasalrin.gov.in</b> if prompted."),
-            ("3", "Select <b>IS</b> or <b>PRI</b> from the Claim Type dropdown."),
-            ("4", "Set Financial Year, Claim Status, Branch/PACS as needed."),
-            ("5", "Click <b>PROCEED</b> — wait for the claims table to appear."),
-            ("6", "The tool auto-processes every row: REVIEW → Approve → Confirm → OK."),
-            ("7", "To verify the other claim type, press <b>Start</b> again and repeat."),
+            ("1", "Click the green <b>▶ Start</b> button at the bottom of this window.",
+                  "A new browser window will open by itself."),
+            ("2", "Log in to the website if it asks you to.",
+                  "Use your usual username and password for fasalrin.gov.in."),
+            ("3", "On the website, go to the page you want to verify.",
+                  "Either <b>Claim Verification</b> or <b>Loan Application</b> — whichever you need today."),
+            ("4", "Fill the dropdowns at the top — Financial Year, Status, Branch.",
+                  "Same as you do every day. For claims, also pick <b>PRI</b> or <b>IS</b>."),
+            ("5", "Click the green <b>PROCEED</b> button on the website.",
+                  "Wait a few seconds — the list of records will appear."),
+            ("6", "A small box will pop up asking <b>“Yes, Start”</b> or <b>“No, Go Back”</b>.",
+                  "It will tell you which page you are on. Read it carefully, then click <b>YES, START</b> if everything looks correct."),
+            ("7", "Sit back. The tool will do the rest by itself.",
+                  "You will see green ticks (✓) for every record done. Don't touch the browser while it is working."),
+            ("8", "When you see <b>“Finished”</b> at the top, the work is done.",
+                  "If you want to do another page, click <b>▶ Start</b> again and repeat."),
         ]
-        for num, txt in steps:
-            row = QHBoxLayout()
+        for num, headline, detail in steps:
+            row = QFrame()
+            row.setStyleSheet("background:#1e1e2e; border-radius:6px;")
+            rh = QHBoxLayout(row)
+            rh.setContentsMargins(10, 10, 10, 10)
+            rh.setSpacing(12)
+
             n = QLabel(num)
-            n.setStyleSheet("color:#cba6f7; font-weight:bold; min-width:18px; font-size:11pt;")
-            n.setAlignment(Qt.AlignTop)
-            t = QLabel(txt)
-            t.setWordWrap(True)
-            t.setTextFormat(Qt.RichText)
-            t.setStyleSheet("color:#cdd6f4; font-size:9pt;")
-            row.addWidget(n)
-            row.addWidget(t, stretch=1)
+            n.setStyleSheet(
+                "color:#1e1e2e; background:#cba6f7; "
+                "font-weight:bold; font-size:14pt; "
+                "min-width:32px; max-width:32px; min-height:32px; max-height:32px; "
+                "border-radius:16px;"
+            )
+            n.setAlignment(Qt.AlignCenter)
+            rh.addWidget(n, alignment=Qt.AlignTop)
+
+            text_col = QVBoxLayout()
+            text_col.setSpacing(2)
+            head = QLabel(headline)
+            head.setTextFormat(Qt.RichText)
+            head.setWordWrap(True)
+            head.setStyleSheet("color:#cdd6f4; font-size:10pt; font-weight:bold;")
+            det = QLabel(detail)
+            det.setTextFormat(Qt.RichText)
+            det.setWordWrap(True)
+            det.setStyleSheet("color:#a6adc8; font-size:9pt;")
+            text_col.addWidget(head)
+            text_col.addWidget(det)
+            rh.addLayout(text_col, stretch=1)
+            v.addLayout(self._wrap_in_layout(row))
+
+        # ── Buttons explained ─────────────────────────────────────────
+        btn_title = QLabel("<b style='font-size:13pt; color:#cba6f7;'>What the buttons do</b>")
+        btn_title.setTextFormat(Qt.RichText)
+        v.addWidget(btn_title)
+
+        button_help = [
+            ("▶ Start",  "#a6e3a1", "Opens the browser and starts everything."),
+            ("⏸ Pause",  "#f9e2af", "Takes a break. The tool will wait until you click Resume."),
+            ("■ Stop",   "#f38ba8", "Stops the tool completely."),
+        ]
+        for name, color, desc in button_help:
+            row = QHBoxLayout()
+            tag = QLabel(name)
+            tag.setStyleSheet(
+                f"color:#1e1e2e; background:{color}; "
+                f"padding:4px 10px; border-radius:4px; "
+                f"font-weight:bold; font-size:10pt; min-width:80px;"
+            )
+            tag.setAlignment(Qt.AlignCenter)
+            d = QLabel(desc)
+            d.setWordWrap(True)
+            d.setStyleSheet("color:#cdd6f4; font-size:10pt;")
+            row.addWidget(tag, alignment=Qt.AlignTop)
+            row.addSpacing(8)
+            row.addWidget(d, stretch=1)
             v.addLayout(row)
 
-        v.addStretch()
-        tip = QLabel("💡 Keep <b>Dry Run</b> on for your first run — it clicks REVIEW only, makes no approvals.")
+        # ── Big tip ───────────────────────────────────────────────────
+        tip = QLabel(
+            "<div style='font-size:11pt; font-weight:bold; color:#f9e2af;'>"
+            "💡 First time using it?</div>"
+            "<div style='font-size:10pt; color:#cdd6f4; margin-top:4px;'>"
+            "Go to <b>Settings</b> tab and turn ON <b>“Dry Run”</b>. "
+            "This makes the tool only LOOK at records without approving anything. "
+            "Once you are happy it is working, turn Dry Run OFF and start for real."
+            "</div>"
+        )
         tip.setTextFormat(Qt.RichText)
         tip.setWordWrap(True)
-        tip.setStyleSheet("color:#a6adc8; font-size:8pt; padding:6px; background:#1e1e2e; border-radius:4px;")
+        tip.setStyleSheet("padding:12px; background:#3d2f1f; border-radius:6px; border-left:4px solid #f9e2af;")
         v.addWidget(tip)
-        return w
+
+        # ── Safety note ───────────────────────────────────────────────
+        safety = QLabel(
+            "<div style='font-size:11pt; font-weight:bold; color:#f38ba8;'>"
+            "⚠ Important safety tips</div>"
+            "<div style='font-size:10pt; color:#cdd6f4; margin-top:4px; line-height:1.5;'>"
+            "• Always read the popup carefully before clicking <b>YES, START</b>.<br/>"
+            "• Do not move your mouse or use the browser while the tool is working.<br/>"
+            "• If something looks wrong, click <b>■ Stop</b> immediately."
+            "</div>"
+        )
+        safety.setTextFormat(Qt.RichText)
+        safety.setWordWrap(True)
+        safety.setStyleSheet("padding:12px; background:#45132a; border-radius:6px; border-left:4px solid #f38ba8;")
+        v.addWidget(safety)
+
+        v.addStretch()
+        scroll.setWidget(w)
+        outer_v.addWidget(scroll)
+        return outer
+
+    def _wrap_in_layout(self, widget):
+        """Helper to put a single QFrame inside a QVBoxLayout for cleaner spacing."""
+        l = QVBoxLayout()
+        l.setContentsMargins(0, 0, 0, 0)
+        l.addWidget(widget)
+        return l
 
     def _build_settings_tab(self) -> QWidget:
         w = QWidget()
@@ -593,10 +860,18 @@ class ClaimApproverGUI(QMainWindow):
         v.setContentsMargins(10, 10, 10, 10)
         v.setSpacing(6)
 
-        self.dry_run_cb = QCheckBox("Dry Run (safe — no actual approvals)")
+        self.dry_run_cb = QCheckBox("Dry Run — practice mode (does NOT approve anything)")
         self.dry_run_cb.setChecked(True)
         self.dry_run_cb.toggled.connect(self._on_dry_run_toggled)
         v.addWidget(self.dry_run_cb)
+
+        dry_help = QLabel(
+            "Turn this ON the first time. It only opens each record without approving — "
+            "so you can safely check that everything is working."
+        )
+        dry_help.setWordWrap(True)
+        dry_help.setStyleSheet("color:#a6adc8; font-size:8pt; padding-left:22px; padding-bottom:4px;")
+        v.addWidget(dry_help)
 
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
@@ -612,10 +887,10 @@ class ClaimApproverGUI(QMainWindow):
         self._delay_sb         = self._make_dsb(0.1, 10.0, config.DELAY_BETWEEN_RECORDS_SEC)
         self._manual_timeout_sb = self._make_sb(30, 600, config.MANUAL_SETUP_TIMEOUT_SEC)
 
-        form.addRow(self._lbl("Max records:"),    self._max_records_sb)
-        form.addRow(self._lbl("Action timeout (s):"), self._timeout_sec_sb)
-        form.addRow(self._lbl("Delay (s):"),      self._delay_sb)
-        form.addRow(self._lbl("Login wait (s):"), self._manual_timeout_sb)
+        form.addRow(self._lbl("Max records to do:"),       self._max_records_sb)
+        form.addRow(self._lbl("Wait per click (sec):"),    self._timeout_sec_sb)
+        form.addRow(self._lbl("Pause between records (sec):"), self._delay_sb)
+        form.addRow(self._lbl("Time to log in (sec):"),    self._manual_timeout_sb)
         v.addLayout(form)
         v.addStretch()
 
@@ -726,6 +1001,7 @@ class ClaimApproverGUI(QMainWindow):
         self.worker.phase_signal.connect(self._set_phase)
         self.worker.progress_signal.connect(self._update_progress)
         self.worker.finished_signal.connect(self._on_finished)
+        self.worker.module_detected.connect(self._on_module_detected)
         self.worker.start()
 
         self.start_btn.setEnabled(False)
@@ -763,6 +1039,19 @@ class ClaimApproverGUI(QMainWindow):
         self.log_display.append(f'<span style="color:{color};">{m}</span>')
         sb = self.log_display.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def _on_module_detected(self, module_name: str, record_count: int):
+        """Show confirmation dialog when a module is detected."""
+        # Bring main window to front first so the dialog has a focused parent
+        self.raise_()
+        self.activateWindow()
+        self.showNormal()                      # restore if minimised
+
+        dialog = ModuleConfirmationDialog(module_name, record_count, self)
+        if dialog.exec() == QDialog.Accepted and dialog.confirmed:
+            self.worker.confirm_module()
+        else:
+            self.worker.reject_module()
 
     def _on_finished(self, approved: int, failed: int):
         self.start_btn.setEnabled(True)
