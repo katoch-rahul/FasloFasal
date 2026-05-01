@@ -3,7 +3,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 # Version info
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 # Playwright Python package
 datas, binaries, hiddenimports = [], [], []

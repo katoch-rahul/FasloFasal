@@ -19,8 +19,8 @@
 # 2. Run the commands below in sequence
 #
 # TO LAUNCH THE APPLICATION:
-cd /c/Projects/faslofasal/FasloFasal
-/c/Projects/faslofasal/.venv/Scripts/python.exe gui.py
+cd c:/Projects/faslofasal/FasloFasal
+c:/Projects/faslofasal/.venv/Scripts/python.exe gui.py
 #
 # AFTER LAUNCHING:
 # - A graphical user interface will appear
