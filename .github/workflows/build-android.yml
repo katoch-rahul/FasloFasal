@@ -59,8 +59,44 @@ jobs:
       - name: Install Buildozer and Cython
         run: pip install --upgrade buildozer cython virtualenv
 
-      - name: Build debug APK
-        run: buildozer -v android debug 2>&1 | tee buildozer.log
+      - name: Pre-accept Android SDK licenses
+        run: |
+          mkdir -p "$HOME/.android"
+          touch "$HOME/.android/repositories.cfg"
+          # Pre-populate license hashes so sdkmanager never prompts
+          mkdir -p "$HOME/.buildozer/android/platform/android-sdk/licenses"
+          printf '\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee' \
+            > "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-license"
+          printf '\n84831b9409646a918e30573bab4c9c91346d8abd' \
+            > "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license"
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+
+      - name: Build debug APK (pass 1 – download SDK)
+        id: build_pass1
+        run: |
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee buildozer.log || true
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+
+      - name: Accept SDK licenses after download
+        run: |
+          SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
+          SDK_MGR="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ -f "$SDK_MGR" ]; then
+            yes | "$SDK_MGR" --licenses 2>/dev/null || true
+            "$SDK_MGR" "build-tools;37.0.0" "platform-tools" "platforms;android-33" 2>&1 || true
+          else
+            echo "sdkmanager not yet present, skipping (cache hit expected)"
+          fi
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+
+      - name: Build debug APK (pass 2 – real build)
+        run: |
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee buildozer.log
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
 
