@@ -191,7 +191,11 @@ class AndroidWebView:
             self._log('[WARN] create() called on non-Android platform — skipped.')
             return
         self._settings = settings
-        self._do_create()
+        try:
+            self._do_create()
+        except Exception as exc:
+            self._log(f'[ERROR] WebView creation failed: {exc}')
+            self._emit_phase('error')
 
     def destroy(self):
         """Detach and destroy WebView. Call from UI thread."""
@@ -207,7 +211,6 @@ class AndroidWebView:
         ws = self._webview.getSettings()
         ws.setJavaScriptEnabled(True)
         ws.setDomStorageEnabled(True)
-        ws.setSavePassword(True)
         ws.setLoadWithOverviewMode(True)
         ws.setUseWideViewPort(True)
         ws.setBuiltInZoomControls(True)
