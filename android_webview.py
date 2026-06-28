@@ -114,6 +114,11 @@ if platform == 'android':
 
     class _PyPageListener(PythonJavaClass):
         __javainterfaces__ = ['org/faslofasal/WebViewCallbacks$PageListener']
+        # Use the *application* class loader, not the system one. Our interface
+        # (org.faslofasal.*) is bundled via android.add_src and is only visible
+        # to the app loader; the default 'system' context raises
+        # "interface ... is not visible from class loader" when the proxy is built.
+        __javacontext__ = 'app'
 
         def __init__(self, on_started: Callable, on_finished: Callable):
             super().__init__()
@@ -130,6 +135,8 @@ if platform == 'android':
 
     class _PyConsoleListener(PythonJavaClass):
         __javainterfaces__ = ['org/faslofasal/WebViewCallbacks$ConsoleListener']
+        # See _PyPageListener: app class loader is required for our add_src interface.
+        __javacontext__ = 'app'
 
         def __init__(self, handler: Callable):
             super().__init__()

@@ -36,6 +36,9 @@ android.ndk = 28c
 # Build architectures (ARM64 for modern phones + ARM for older)
 android.archs = arm64-v8a, armeabi-v7a
 
+# Lock the app to portrait (claim list reads better vertically)
+orientation = portrait
+
 # Activity entry point (default for Kivy apps)
 android.entrypoint = org.kivy.android.PythonActivity
 
