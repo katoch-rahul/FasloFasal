@@ -1,6 +1,7 @@
 """GUI wrapper for PRI Claim Verification automation — compact redesign."""
 
 import csv
+import re
 import subprocess
 import sys
 import threading
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QDialog,
     QScrollArea,
+    QFileDialog,
 )
 from playwright.sync_api import (
     Page,
@@ -194,7 +196,8 @@ PHASES = {
 
 # ── Module Confirmation Dialog ────────────────────────────────────────────────
 class ModuleConfirmationDialog(QDialog):
-    def __init__(self, module_name: str, record_count: int = 0, parent=None):
+    def __init__(self, module_name: str, record_count: int = 0,
+                 require_excel: bool = False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Confirm Before Starting")
         self.setMinimumWidth(440)
@@ -208,6 +211,10 @@ class ModuleConfirmationDialog(QDialog):
             | Qt.WindowCloseButtonHint
         )
         self.setModal(True)
+        self.require_excel = require_excel
+        self.excel_path = None          # set once a valid workbook is chosen
+        self.lookup = None              # ISClaimLookup, set after a successful load
+        self.confirm_btn = None
         self._build_ui(module_name, record_count)
         self.confirmed = False
 
@@ -258,6 +265,10 @@ class ModuleConfirmationDialog(QDialog):
             count_lbl.setStyleSheet("padding:8px; background:#1e1e2e; border-radius:6px;")
             v.addWidget(count_lbl)
 
+        # Excel upload — only for the IS-Claim fill flow
+        if self.require_excel:
+            v.addWidget(self._build_excel_section())
+
         # Warning
         warn = QLabel("⚠  If this is the wrong page, click <b>NO, GO BACK</b> and start again.")
         warn.setTextFormat(Qt.RichText)
@@ -273,16 +284,82 @@ class ModuleConfirmationDialog(QDialog):
         cancel.setObjectName("stopBtn")
         cancel.setFixedHeight(44)
         cancel.clicked.connect(self.reject)
-        confirm = QPushButton("✓  YES, START")
-        confirm.setObjectName("startBtn")
-        confirm.setFixedHeight(44)
-        confirm.setDefault(True)
-        confirm.clicked.connect(self._on_confirm)
+        self.confirm_btn = QPushButton("✓  YES, START")
+        self.confirm_btn.setObjectName("startBtn")
+        self.confirm_btn.setFixedHeight(44)
+        self.confirm_btn.setDefault(True)
+        self.confirm_btn.clicked.connect(self._on_confirm)
+        # For the IS-Claim flow, can't start until a valid Excel is loaded.
+        if self.require_excel:
+            self.confirm_btn.setEnabled(False)
         h.addWidget(cancel)
-        h.addWidget(confirm)
+        h.addWidget(self.confirm_btn)
         v.addLayout(h)
 
+    def _build_excel_section(self) -> QFrame:
+        box = QFrame()
+        box.setStyleSheet(
+            "background:#1e1e2e; border-radius:6px; border-left:4px solid #89b4fa;"
+        )
+        bv = QVBoxLayout(box)
+        bv.setContentsMargins(12, 10, 12, 10)
+        bv.setSpacing(6)
+
+        head = QLabel("📄  This page needs your IS-claim Excel file")
+        head.setStyleSheet("color:#89b4fa; font-size:10pt; font-weight:bold;")
+        bv.addWidget(head)
+
+        self.upload_btn = QPushButton("📁  Choose Excel file…")
+        self.upload_btn.setObjectName("pauseBtn")
+        self.upload_btn.setFixedHeight(36)
+        self.upload_btn.clicked.connect(self._choose_excel)
+        bv.addWidget(self.upload_btn)
+
+        self.excel_status = QLabel("No file chosen yet.")
+        self.excel_status.setWordWrap(True)
+        self.excel_status.setStyleSheet("color:#a6adc8; font-size:9pt;")
+        bv.addWidget(self.excel_status)
+        return box
+
+    def _choose_excel(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select your IS-claim Excel", "", "Excel files (*.xlsx *.xls)"
+        )
+        if not path:
+            return
+        self.upload_btn.setText("Loading…")
+        self.upload_btn.setEnabled(False)
+        self.excel_status.setText("Reading workbook, please wait…")
+        self.excel_status.setStyleSheet("color:#a6adc8; font-size:9pt;")
+        QApplication.processEvents()
+        try:
+            # imported lazily so launching the GUI doesn't pull in pandas
+            from is_claim_data import ISClaimLookup
+            lookup = ISClaimLookup.load(path)
+        except Exception as e:
+            self.excel_path = None
+            self.lookup = None
+            self.excel_status.setText(f"✕  Could not read this file:\n{e}")
+            self.excel_status.setStyleSheet("color:#f38ba8; font-size:9pt; font-weight:bold;")
+            self.upload_btn.setText("📁  Choose Excel file…")
+            self.upload_btn.setEnabled(True)
+            self.confirm_btn.setEnabled(False)
+            return
+
+        self.excel_path = path
+        self.lookup = lookup
+        name = Path(path).name
+        dup = f" ({len(lookup.duplicates)} duplicate accounts ignored)" if lookup.duplicates else ""
+        self.excel_status.setText(f"✓  {name}\n{lookup.count} accounts loaded{dup}")
+        self.excel_status.setStyleSheet("color:#a6e3a1; font-size:9pt; font-weight:bold;")
+        self.upload_btn.setText("📁  Change file…")
+        self.upload_btn.setEnabled(True)
+        self.confirm_btn.setEnabled(True)
+
     def _on_confirm(self):
+        # Defensive: never allow confirming the IS flow without a loaded workbook.
+        if self.require_excel and self.lookup is None:
+            return
         self.confirmed = True
         self.accept()
 
@@ -293,7 +370,7 @@ class AutomationWorker(QThread):
     phase_signal         = Signal(str)
     progress_signal      = Signal(int, int)        # approved, failed
     finished_signal      = Signal(int, int)
-    module_detected      = Signal(str, int)        # module_name, record_count
+    module_detected      = Signal(str, int, bool)  # module_name, record_count, needs_excel
 
     def __init__(self, settings: dict):
         super().__init__()
@@ -306,6 +383,13 @@ class AutomationWorker(QThread):
         self.approved    = 0
         self.failed      = 0
         self.module_name = ""
+        self.flow        = "approval"   # "approval" (REVIEW) or "is_fill" (Add)
+        self.lookup      = None         # ISClaimLookup, set for the is_fill flow
+        self._is_form_dumped = False    # dump the IS form DOM once per run for tuning
+
+    def set_lookup(self, lookup):
+        """Called by the GUI after the user uploads the IS-claim Excel."""
+        self.lookup = lookup
 
     def stop(self):
         self.is_running = False
@@ -348,20 +432,34 @@ class AutomationWorker(QThread):
     def _log(self, msg: str):
         self.log_signal.emit(msg)
 
-    def _detect_module(self, page: Page) -> str:
-        """Detect which module is being verified based on page URL and content."""
-        url = page.url
-        if "loan-application-list" in url:
-            return "LOAN APPLICATION VERIFICATION"
-        elif "claim-application-list" in url:
-            return "CLAIM VERIFICATION"
-        return "UNKNOWN MODULE"
+    def _detect_flow(self, page: Page) -> tuple[str, str]:
+        """Decide which workflow the visible table belongs to.
 
-    def _get_record_count(self, page: Page) -> int:
-        """Get the number of records visible in the table."""
+        IS-Claim fill flow → rows carry "Add" buttons (data entry).
+        Approval flow      → rows carry "REVIEW" buttons.
+        Returns (flow, human_module_name)."""
+        url = page.url
         try:
-            review_buttons = page.locator(config.SELECTORS["review_button"])
-            return review_buttons.count()
+            add_n = page.locator(config.IS_CLAIM_SELECTORS["add_button"]).count()
+        except Exception:
+            add_n = 0
+        try:
+            review_n = page.locator(config.SELECTORS["review_button"]).count()
+        except Exception:
+            review_n = 0
+
+        if "claim-application-list" in url and add_n > 0 and review_n == 0:
+            return "is_fill", "IS CLAIM — FILL FROM EXCEL"
+        if "loan-application-list" in url:
+            return "approval", "LOAN APPLICATION VERIFICATION"
+        return "approval", "CLAIM VERIFICATION"
+
+    def _get_record_count(self, page: Page, flow: str = "approval") -> int:
+        """Number of actionable rows visible for the given flow."""
+        sel = (config.IS_CLAIM_SELECTORS["add_button"] if flow == "is_fill"
+               else config.SELECTORS["review_button"])
+        try:
+            return page.locator(sel).count()
         except Exception:
             return 0
 
@@ -369,23 +467,25 @@ class AutomationWorker(QThread):
         page.goto(config.LIST_URL, wait_until="domcontentloaded")
         self.phase_signal.emit("waiting")
         self._log("[INFO] Browser opened. Select a module and click PROCEED.")
+        # Wait for either an approval table (REVIEW) or an IS-fill table (Add).
+        combined = f'{config.SELECTORS["review_button"]}, {config.IS_CLAIM_SELECTORS["add_button"]}'
         try:
-            page.wait_for_selector(
-                config.SELECTORS["review_button"],
-                timeout=self.settings["manual_timeout"] * 1000,
-            )
+            page.wait_for_selector(combined, timeout=self.settings["manual_timeout"] * 1000)
             self._log("[OK] Table detected. Waiting for confirmation…")
             page.wait_for_timeout(1500)
 
-            # Detect module and get record count
-            module = self._detect_module(page)
-            count = self._get_record_count(page)
+            # Detect flow + module and get record count
+            flow, module = self._detect_flow(page)
+            self.flow = flow
             self.module_name = module
-            self._log(f"[INFO] Detected module: {module} (Records: {count})")
-            self.module_detected.emit(module, count)
+            count = self._get_record_count(page, flow)
+            self._log(f"[INFO] Detected: {module} (flow={flow}, rows={count})")
+            self.module_detected.emit(module, count, flow == "is_fill")
 
-            # Wait for user confirmation
+            # Wait for user confirmation (and, for is_fill, an uploaded Excel)
             self._wait_for_module_confirmation()
+            if flow == "is_fill" and self.lookup is None:
+                raise RuntimeError("No IS-claim Excel was loaded — cannot start the fill run.")
 
             self._log("[OK] Starting automation…")
             self.phase_signal.emit("running")
@@ -445,10 +545,12 @@ class AutomationWorker(QThread):
         except Exception:
             return ""
 
-    def _log_record(self, writer, index: int, status: str, error: str) -> None:
+    def _log_record(self, writer, index: int, status: str, error: str,
+                    account: str = "") -> None:
         writer.writerow({
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "index":     index,
+            "account":   account,
             "status":    status,
             "error":     error,
         })
@@ -521,10 +623,10 @@ class AutomationWorker(QThread):
         if self.settings["dry_run"]:
             self._log("[INFO] DRY RUN — no real approvals.")
 
-        max_rec = self.settings["max_records"]
-
         with open(log_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["timestamp", "index", "status", "error"])
+            writer = csv.DictWriter(
+                f, fieldnames=["timestamp", "index", "account", "status", "error"]
+            )
             writer.writeheader()
             f.flush()
 
@@ -538,46 +640,10 @@ class AutomationWorker(QThread):
 
                 try:
                     self._wait_for_login_and_table(page)
-
-                    for i in count():
-                        if not self.is_running:
-                            self._log("[INFO] Stopped by user.")
-                            break
-                        self._wait_if_paused()
-                        if not self.is_running:
-                            break
-                        if self.approved >= max_rec:
-                            self._log(f"[INFO] Reached limit ({max_rec}). Stopping.")
-                            break
-                        try:
-                            result = self._process_one(page, writer, i)
-                            f.flush()
-                            if result in ("no_more_records", "stopped"):
-                                if result == "no_more_records":
-                                    self._log("[INFO] No more records.")
-                                break
-                            self.approved += 1
-                            self.progress_signal.emit(self.approved, self.failed)
-                            self._log(f"[OK] Record {i} done. (Total: {self.approved})")
-                        except PlaywrightTimeoutError as e:
-                            self.failed += 1
-                            shot = self._screenshot(page, f"timeout_{i}")
-                            self._log_record(writer, i, "failed_timeout", f"{e} | screenshot={shot}")
-                            f.flush()
-                            self.progress_signal.emit(self.approved, self.failed)
-                            self._log(f"[ERROR] Timeout on {i}. {shot}")
-                            self._recover(page)
-                        except Exception as e:
-                            self.failed += 1
-                            shot = self._screenshot(page, f"err_{i}")
-                            self._log_record(writer, i, "failed", f"{e} | screenshot={shot}")
-                            f.flush()
-                            self.progress_signal.emit(self.approved, self.failed)
-                            self._log(f"[ERROR] Record {i}: {e}")
-                            self._recover(page)
-
-                        time.sleep(self.settings["delay_between_records"])
-
+                    if self.flow == "is_fill":
+                        self._run_is_fill(page, writer, f)
+                    else:
+                        self._run_approval(page, writer, f)
                 except KeyboardInterrupt:
                     self._log("[INFO] Interrupted.")
                 finally:
@@ -589,6 +655,422 @@ class AutomationWorker(QThread):
         self._log(f"[DONE] ✓{self.approved} ✕{self.failed}")
         self.phase_signal.emit("done")
         self.finished_signal.emit(self.approved, self.failed)
+
+    # ── approval flow (REVIEW → Approve → Confirm → OK) ──────────────────────
+    def _run_approval(self, page: Page, writer, f) -> None:
+        max_rec = self.settings["max_records"]
+        for i in count():
+            if not self.is_running:
+                self._log("[INFO] Stopped by user.")
+                break
+            self._wait_if_paused()
+            if not self.is_running:
+                break
+            if self.approved >= max_rec:
+                self._log(f"[INFO] Reached limit ({max_rec}). Stopping.")
+                break
+            try:
+                result = self._process_one(page, writer, i)
+                f.flush()
+                if result in ("no_more_records", "stopped"):
+                    if result == "no_more_records":
+                        self._log("[INFO] No more records.")
+                    break
+                self.approved += 1
+                self.progress_signal.emit(self.approved, self.failed)
+                self._log(f"[OK] Record {i} done. (Total: {self.approved})")
+            except PlaywrightTimeoutError as e:
+                self.failed += 1
+                shot = self._screenshot(page, f"timeout_{i}")
+                self._log_record(writer, i, "failed_timeout", f"{e} | screenshot={shot}")
+                f.flush()
+                self.progress_signal.emit(self.approved, self.failed)
+                self._log(f"[ERROR] Timeout on {i}. {shot}")
+                self._recover(page)
+            except Exception as e:
+                self.failed += 1
+                shot = self._screenshot(page, f"err_{i}")
+                self._log_record(writer, i, "failed", f"{e} | screenshot={shot}")
+                f.flush()
+                self.progress_signal.emit(self.approved, self.failed)
+                self._log(f"[ERROR] Record {i}: {e}")
+                self._recover(page)
+
+            time.sleep(self.settings["delay_between_records"])
+
+    # ── IS-Claim fill flow (Add → fill from Excel → Save & Continue → Submit) ─
+    @staticmethod
+    def _mask(account: str) -> str:
+        a = str(account or "")
+        return ("•" * max(0, len(a) - 4)) + a[-4:] if a else "?"
+
+    def _run_is_fill(self, page: Page, writer, f) -> None:
+        max_rec = self.settings["max_records"]
+        dry = self.settings["dry_run"]
+        if dry:
+            self._log("[INFO] DRY RUN — fields will be filled but NOT Saved/Submitted.")
+        else:
+            self._log("[WARN] LIVE — each matched record will be Saved & Submitted.")
+        for i in count():
+            if not self.is_running:
+                self._log("[INFO] Stopped by user.")
+                break
+            self._wait_if_paused()
+            if not self.is_running:
+                break
+            if self.approved >= max_rec:
+                self._log(f"[INFO] Reached limit ({max_rec}). Stopping.")
+                break
+            try:
+                result = self._fill_one_is_claim(page, writer, i, dry)
+                f.flush()
+                if result == "no_more":
+                    self._log("[INFO] No more rows to process.")
+                    break
+                if result in ("filled", "dry"):
+                    self.approved += 1
+                    self.progress_signal.emit(self.approved, self.failed)
+                    self._log(f"[OK] Row {i} done. (Total: {self.approved})")
+                elif result == "skip":
+                    self.failed += 1
+                    self.progress_signal.emit(self.approved, self.failed)
+            except PlaywrightTimeoutError as e:
+                self.failed += 1
+                shot = self._screenshot(page, f"is_timeout_{i}")
+                self._log_record(writer, i, "failed_timeout", f"{e} | screenshot={shot}")
+                f.flush()
+                self.progress_signal.emit(self.approved, self.failed)
+                self._log(f"[ERROR] Timeout on row {i}. {shot}")
+                self._is_recover(page)
+            except Exception as e:
+                self.failed += 1
+                shot = self._screenshot(page, f"is_err_{i}")
+                self._log_record(writer, i, "failed", f"{e} | screenshot={shot}")
+                f.flush()
+                self.progress_signal.emit(self.approved, self.failed)
+                self._log(f"[ERROR] Row {i}: {e}")
+                self._is_recover(page)
+
+            time.sleep(self.settings["delay_between_records"])
+
+    def _wait_for_add_or_paginate(self, page: Page) -> bool:
+        try:
+            page.wait_for_selector(
+                config.IS_CLAIM_SELECTORS["add_button"],
+                timeout=self.settings["list_refresh_timeout"],
+                state="visible",
+            )
+            return True
+        except PlaywrightTimeoutError:
+            pass
+        next_btn = page.locator(config.SELECTORS["next_page_button"])
+        try:
+            if next_btn.count() > 0 and next_btn.first.is_visible():
+                self._log("[INFO] Next page…")
+                next_btn.first.click(timeout=self.settings["per_record_timeout"])
+                page.wait_for_timeout(2000)
+                page.wait_for_selector(
+                    config.IS_CLAIM_SELECTORS["add_button"],
+                    timeout=self.settings["list_refresh_timeout"],
+                    state="visible",
+                )
+                return True
+        except Exception as e:
+            self._log(f"[INFO] Pagination failed: {e}")
+        return False
+
+    def _fill_one_is_claim(self, page: Page, writer, index: int, dry: bool) -> str:
+        if not self._wait_for_add_or_paginate(page):
+            return "no_more"
+        add_btns = page.locator(config.IS_CLAIM_SELECTORS["add_button"])
+        n = add_btns.count()
+        # In dry run nothing is submitted, so rows don't disappear — step through
+        # them by index. Live runs always take the first remaining row.
+        if dry and index >= n:
+            return "no_more"
+        self._log(f"[{index}] {n} Add button(s) visible.")
+        target = add_btns.nth(index) if dry else add_btns.first
+        target.click(timeout=self.settings["per_record_timeout"])
+        page.wait_for_timeout(1200)
+
+        account = self._read_account_from_form(page)
+        if not account:
+            self._log(f"[{index}] [WARN] Couldn't read Account No. from the form.")
+            self._log_record(writer, index, "no_account", "account header not found")
+            self._is_back_to_list(page)
+            return "skip"
+
+        rec = self.lookup.get(account)
+        if rec is None:
+            self._log(f"[{index}] [WARN] Account {self._mask(account)} not in Excel — skipping.")
+            self._log_record(writer, index, "not_in_excel", "", account=account)
+            self._is_back_to_list(page)
+            return "skip"
+
+        self._log(f"[{index}] Account {self._mask(account)} matched — filling…")
+        self._dump_form_html(page)
+        self._fill_is_form(page, rec)
+
+        if dry:
+            self._log(f"[{index}] DRY RUN — filled, not saving. Returning to list.")
+            self._log_record(writer, index, "dry_run_filled", "", account=account)
+            self._is_back_to_list(page)
+            return "dry"
+
+        # LIVE: Save & Continue → review → Submit
+        page.locator(config.IS_CLAIM_SELECTORS["save_button"]).first.click(
+            timeout=self.settings["per_record_timeout"])
+        page.wait_for_timeout(1500)
+        page.locator(config.IS_CLAIM_SELECTORS["submit_button"]).first.click(
+            timeout=self.settings["per_record_timeout"])
+        page.wait_for_timeout(2000)
+        self._log_record(writer, index, "submitted", "", account=account)
+        return "filled"
+
+    def _dump_form_html(self, page: Page) -> None:
+        """Save the IS form DOM once per run so selectors can be tuned to the
+        real markup. Written to logs/ (git-ignored) — local only."""
+        if self._is_form_dumped:
+            return
+        try:
+            path = config.LOGS_DIR / "is_form_dump.html"
+            path.write_text(page.content(), encoding="utf-8")
+            self._is_form_dumped = True
+            self._log(f"[DEBUG] Saved form HTML for selector tuning: {path.name}")
+        except Exception as e:
+            self._log(f"[DEBUG] Could not save form HTML: {e}")
+
+    def _read_account_from_form(self, page: Page) -> str:
+        """Read the Account No. shown in the form header. Best-effort text scrape;
+        tighten against real HTML if it ever misreads."""
+        text = ""
+        try:
+            loc = page.locator(config.IS_CLAIM_SELECTORS["account_no_label"]).first
+            loc.wait_for(timeout=self.settings["per_record_timeout"], state="visible")
+            text = loc.locator("xpath=..").inner_text(timeout=5000)
+        except Exception:
+            try:
+                text = page.inner_text("body", timeout=5000)
+            except Exception:
+                return ""
+        m = re.search(r"Account\s*No\.?\D*(\d{10,18})", text)
+        if m:
+            return m.group(1)
+        m = re.search(r"\b(\d{12,18})\b", text)
+        return m.group(1) if m else ""
+
+    def _read_eligible_amount(self, page: Page) -> str:
+        """Read 'Eligible Loan Amount for IS' from the Activities table — the
+        value to type into Max Withdrawal Amount (per SOP). Takes the last
+        non-empty cell, i.e. the Total row. Returns whole rupees as digits."""
+        cells = page.locator("td.eligibleLoanAmount")
+        best = ""
+        try:
+            for i in range(cells.count()):
+                raw = cells.nth(i).inner_text(timeout=2000)
+                digits = re.sub(r"\D", "", raw.split(".")[0])   # drop paise, ₹ and commas
+                if digits:
+                    best = digits
+        except Exception:
+            pass
+        return best
+
+    def _fill_is_form(self, page: Page, rec) -> None:
+        for field in config.IS_CLAIM_FIELDS:
+            src = field["source"]
+            if src == "constant":
+                value = field.get("value", "")
+            elif src == "excel":
+                value = getattr(rec, field["key"], "")
+            elif src == "portal":      # read Eligible Loan Amount for IS off the form
+                value = self._read_eligible_amount(page)
+            else:
+                value = None
+            try:
+                self._set_field(page, field, value)
+            except Exception as e:
+                self._log(f"     · [WARN] couldn't set {field['label']}: {e}")
+            # Selecting the submission type enables the downstream fields — give
+            # the React form a moment to re-render before filling dates/amounts.
+            if field["key"] == "is_submission_type":
+                page.wait_for_timeout(700)
+        self._tick_declaration(page)
+
+    def _set_field(self, page: Page, field: dict, value) -> None:
+        sel = field["selector"]
+        loc = page.locator(sel).first
+        try:
+            loc.wait_for(state="visible", timeout=self.settings["per_record_timeout"])
+        except Exception:
+            self._log(f"     · [WARN] {field['label']} not found ({sel})")
+            return
+
+        if field["type"] == "dropdown":
+            loc.select_option(label=str(value), timeout=self.settings["per_record_timeout"])
+            self._log(f"     · {field['label']} = {value}")
+            return
+
+        if value in ("", None):
+            return
+        if not self._wait_editable(page, loc, 6000):
+            self._log(f"     · [WARN] {field['label']} stayed disabled — skipped")
+            return
+
+        if field["type"] == "date":
+            self._type_date(page, loc, str(value))
+        else:
+            loc.click(timeout=self.settings["per_record_timeout"])
+            loc.fill(str(value), timeout=self.settings["per_record_timeout"])
+        self._log(f"     · {field['label']} = {value}  (got: {self._safe_value(loc)})")
+
+    MONTHS = ["january", "february", "march", "april", "may", "june", "july",
+              "august", "september", "october", "november", "december"]
+
+    def _type_date(self, page: Page, loc, value: str) -> None:
+        """Set an rmdp date by driving its calendar. The input ignores typed and
+        programmatic values, so we open the popup, step to the target month/year
+        with the arrows, then click the day cell."""
+        try:
+            dt = datetime.strptime(value, config.IS_CLAIM_DATE_FORMAT)
+        except Exception:
+            self._log(f"     · [WARN] bad date value {value!r}")
+            return
+        self._close_calendar(page)
+        try:
+            loc.scroll_into_view_if_needed(timeout=4000)
+        except Exception:
+            pass
+        loc.click(timeout=self.settings["per_record_timeout"])
+        cal = page.locator(".rmdp-calendar, .rmdp-wrapper").first
+        try:
+            cal.wait_for(state="visible", timeout=8000)
+        except Exception:
+            self._log("     · [WARN] calendar did not open")
+            return
+        if not self._navigate_calendar_to(page, dt.month, dt.year):
+            self._log(f"     · [WARN] could not reach {dt.month:02d}/{dt.year} in calendar")
+            self._close_calendar(page)
+            return
+        self._click_calendar_day(page, dt.day)
+        page.wait_for_timeout(150)
+        self._close_calendar(page)
+
+    def _month_index(self, name: str):
+        key = name.strip().lower()[:3]
+        for i, mn in enumerate(self.MONTHS):
+            if mn.startswith(key):
+                return i + 1
+        return None
+
+    def _navigate_calendar_to(self, page: Page, month: int, year: int) -> bool:
+        for _ in range(80):                      # cap: plenty for any FY span
+            try:
+                txt = page.locator(".rmdp-header-values").first.inner_text(timeout=3000).strip()
+            except Exception:
+                return False
+            m = re.search(r"([A-Za-z]+)\D+(\d{4})", txt)
+            if not m:
+                return False
+            cur_month = self._month_index(m.group(1))
+            cur_year = int(m.group(2))
+            if cur_month == month and cur_year == year:
+                return True
+            go_next = (cur_year, cur_month) < (year, month)
+            arrow = (".rmdp-arrow-container.rmdp-right" if go_next
+                     else ".rmdp-arrow-container.rmdp-left")
+            try:
+                page.locator(arrow).first.click(timeout=3000)
+            except Exception:
+                return False
+            page.wait_for_timeout(110)
+        return False
+
+    def _click_calendar_day(self, page: Page, day: int) -> None:
+        # Exclude days bleeding in from adjacent months (hidden/deactivated).
+        days = page.locator(
+            ".rmdp-day:not(.rmdp-day-hidden):not(.rmdp-deactive)")
+        target = str(int(day))
+        for i in range(days.count()):
+            d = days.nth(i)
+            try:
+                if d.inner_text(timeout=1500).strip() == target:
+                    d.click(timeout=self.settings["per_record_timeout"])
+                    return
+            except Exception:
+                continue
+        self._log(f"     · [WARN] day {day} not found in calendar grid")
+
+    def _close_calendar(self, page: Page) -> None:
+        """Dismiss any open rmdp calendar popup so it can't intercept clicks."""
+        try:
+            cal = page.locator(".rmdp-wrapper, .rmdp-calendar")
+            if cal.count() == 0 or not cal.first.is_visible():
+                return
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(120)
+            if cal.count() > 0 and cal.first.is_visible():
+                page.mouse.click(4, 4)           # neutral click to dismiss
+                page.wait_for_timeout(120)
+        except Exception:
+            pass
+
+    def _tick_declaration(self, page: Page) -> None:
+        try:
+            cb = page.locator(config.IS_CLAIM_SELECTORS["declaration_checkbox"]).first
+            if not cb.is_checked():
+                cb.check(timeout=self.settings["per_record_timeout"])
+            self._log("     · Declaration ticked")
+        except Exception as e:
+            self._log(f"     · [WARN] couldn't tick declaration: {e}")
+
+    def _wait_editable(self, page: Page, loc, timeout_ms: int) -> bool:
+        deadline = time.time() + timeout_ms / 1000
+        while time.time() < deadline:
+            try:
+                if loc.is_editable():
+                    return True
+            except Exception:
+                pass
+            page.wait_for_timeout(150)
+        return False
+
+    @staticmethod
+    def _safe_value(loc) -> str:
+        try:
+            return (loc.input_value() or "").strip()
+        except Exception:
+            return ""
+
+    def _is_back_to_list(self, page: Page) -> None:
+        back = page.locator(config.IS_CLAIM_SELECTORS["back_button"])
+        try:
+            if back.count() > 0 and back.first.is_visible():
+                back.first.click(timeout=self.settings["per_record_timeout"])
+                page.wait_for_timeout(1200)
+                if page.locator(config.IS_CLAIM_SELECTORS["add_button"]).count() > 0:
+                    return
+        except Exception:
+            pass
+        try:
+            page.go_back(wait_until="domcontentloaded")
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+    def _is_recover(self, page: Page) -> None:
+        for attempt in ("escape", "back"):
+            try:
+                if attempt == "escape":
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(500)
+                else:
+                    page.go_back(wait_until="domcontentloaded")
+                    page.wait_for_timeout(1000)
+                if page.locator(config.IS_CLAIM_SELECTORS["add_button"]).count() > 0:
+                    return
+            except Exception:
+                continue
+        self._log("[WARN] Could not auto-recover the IS list — may need to redo PROCEED.")
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
@@ -1040,15 +1522,18 @@ class ClaimApproverGUI(QMainWindow):
         sb = self.log_display.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _on_module_detected(self, module_name: str, record_count: int):
-        """Show confirmation dialog when a module is detected."""
+    def _on_module_detected(self, module_name: str, record_count: int, needs_excel: bool):
+        """Show confirmation dialog when a module is detected. For the IS-Claim
+        fill flow the same dialog also collects the Excel file."""
         # Bring main window to front first so the dialog has a focused parent
         self.raise_()
         self.activateWindow()
         self.showNormal()                      # restore if minimised
 
-        dialog = ModuleConfirmationDialog(module_name, record_count, self)
+        dialog = ModuleConfirmationDialog(module_name, record_count, needs_excel, self)
         if dialog.exec() == QDialog.Accepted and dialog.confirmed:
+            if needs_excel and dialog.lookup is not None:
+                self.worker.set_lookup(dialog.lookup)
             self.worker.confirm_module()
         else:
             self.worker.reject_module()
