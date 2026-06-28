@@ -186,21 +186,38 @@ class AndroidWebView:
     # ── WebView lifecycle (must be called from Kivy/UI thread) ───────────────
 
     def create(self, settings: dict):
-        """Create WebView and attach to Activity. Call from UI thread."""
+        """Create WebView and attach to Activity.
+
+        Android requires that Views (and the WebView in particular) are created
+        and touched only on the Android UI thread. Under Kivy, Python code runs
+        on a *separate* thread, so we must hop onto the UI thread explicitly —
+        otherwise WebView construction throws and the app shows an error.
+        """
         if platform != 'android':
             self._log('[WARN] create() called on non-Android platform — skipped.')
             return
         self._settings = settings
-        try:
-            self._do_create()
-        except Exception as exc:
-            self._log(f'[ERROR] WebView creation failed: {exc}')
-            self._emit_phase('error')
+
+        @run_on_ui_thread
+        def _create_on_ui_thread():
+            try:
+                self._do_create()
+            except Exception as exc:
+                self._log(f'[ERROR] WebView creation failed: {exc!r}')
+                self._emit_phase('error')
+
+        _create_on_ui_thread()
 
     def destroy(self):
-        """Detach and destroy WebView. Call from UI thread."""
-        if platform == 'android':
+        """Detach and destroy WebView (hops onto the Android UI thread)."""
+        if platform != 'android':
+            return
+
+        @run_on_ui_thread
+        def _destroy_on_ui_thread():
             self._do_destroy()
+
+        _destroy_on_ui_thread()
 
     # ── Private UI-thread methods ─────────────────────────────────────────────
 
@@ -260,21 +277,21 @@ class AndroidWebView:
     # ── JS execution ─────────────────────────────────────────────────────────
 
     def _exec_js_fire(self, code: str):
-        """Fire-and-forget JS. Safe to call from UI thread or background thread."""
+        """Fire-and-forget JS. Safe to call from any thread.
+
+        evaluateJavascript must run on the Android UI thread. Kivy's "main"
+        thread is NOT that thread, so we always post onto the UI thread via
+        run_on_ui_thread (which runs inline if we happen to already be on it).
+        """
         if not self._webview or platform != 'android':
             return
-        if threading.current_thread() is threading.main_thread():
-            # Already on UI thread — execute directly
-            self._webview.evaluateJavascript(code, None)
-        else:
-            done = threading.Event()
 
-            def _run():
+        @run_on_ui_thread
+        def _run():
+            if self._webview:
                 self._webview.evaluateJavascript(code, None)
-                done.set()
 
-            run_on_ui_thread(_run)()
-            done.wait(timeout=5.0)
+        _run()
 
     def _js_eval(self, expr: str, timeout: float = 8.0) -> Optional[str]:
         """Evaluate JS expression and return result (background thread only).
@@ -301,9 +318,8 @@ class AndroidWebView:
         self._page_loaded.clear()
 
     def _handle_page_finished(self, url: str):
-        # Inject helpers — fire-and-forget, we're on UI thread
-        if self._webview and platform == 'android':
-            self._webview.evaluateJavascript(_JS_HELPERS, None)
+        # Inject helpers — fire-and-forget on the Android UI thread.
+        self._exec_js_fire(_JS_HELPERS)
         self._page_loaded.set()
 
     def _handle_console(self, payload: str):
@@ -399,7 +415,7 @@ class AndroidWebView:
             self._wait_page_load(8.0)
             return 'ok'
 
-        self._log(f'[{index}] REVIEW → Approve → Confirm → OK…')
+        self._log(f'[{index}] REVIEW -> Approve -> Confirm -> OK...')
         if not self._click(cfg.BUTTON_TEXTS['review']):
             self._log(f'[{index}] Could not click REVIEW.')
             return 'error'

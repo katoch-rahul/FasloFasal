@@ -45,13 +45,16 @@ TEXT    = get_color_from_hex('#cdd6f4')
 MUTED   = get_color_from_hex('#a6adc8')
 BLUE    = get_color_from_hex('#89b4fa')
 
+# Note: keep glyphs to font-safe characters. Kivy's default Roboto font does
+# not include media-control / symbol glyphs (e.g. U+25B6, U+23F8), which render
+# as empty "tofu" boxes on device. A plain bullet renders everywhere.
 PHASES = {
-    'idle':    ('●', YELLOW, 'Ready',             'Tap ▶ Start to begin'),
-    'waiting': ('●', BLUE,   'Waiting for you…',  'Log in and click PROCEED on the portal'),
-    'running': ('●', GREEN,  'Working…',           'Approving records — do not touch the browser'),
-    'paused':  ('●', YELLOW, 'Paused',            'Tap Resume when ready'),
-    'done':    ('✓', GREEN,  'Finished!',          'Check Log tab for details'),
-    'error':   ('✕', RED,    'Something went wrong', 'Check Log tab'),
+    'idle':    ('•', YELLOW, 'Ready',             'Tap Start to begin'),
+    'waiting': ('•', BLUE,   'Waiting for you...', 'Log in and click PROCEED on the portal'),
+    'running': ('•', GREEN,  'Working...',         'Approving records - do not touch the browser'),
+    'paused':  ('•', YELLOW, 'Paused',            'Tap Resume when ready'),
+    'done':    ('•', GREEN,  'Finished!',          'Check Log tab for details'),
+    'error':   ('•', RED,    'Something went wrong', 'Check Log tab'),
 }
 
 Builder.load_string("""
@@ -138,7 +141,7 @@ class ControlScreen(Screen):
             pos=lambda w, v: setattr(self._card_bg, 'pos', v),
             size=lambda w, v: setattr(self._card_bg, 'size', v),
         )
-        self._dot  = Label(text='●', font_size=dp(20), color=YELLOW,
+        self._dot  = Label(text='•', font_size=dp(20), color=YELLOW,
                            size_hint_x=None, width=dp(28))
         col = BoxLayout(orientation='vertical', spacing=dp(2))
         self._status_text = Label(
@@ -146,14 +149,14 @@ class ControlScreen(Screen):
             halign='left', valign='center',
         )
         self._status_hint = Label(
-            text='Tap ▶ Start to begin', font_size=dp(11), color=MUTED,
+            text='Tap Start to begin', font_size=dp(11), color=MUTED,
             halign='left', valign='center',
         )
         col.add_widget(self._status_text)
         col.add_widget(self._status_hint)
         self._progress_lbl = Label(
-            text='✓0  ✕0', font_size=dp(12), color=MUTED,
-            size_hint_x=None, width=dp(70), halign='right',
+            text='OK 0  Err 0', markup=True, font_size=dp(12), color=MUTED,
+            size_hint_x=None, width=dp(96), halign='right', valign='center',
         )
         status_card.add_widget(self._dot)
         status_card.add_widget(col)
@@ -202,17 +205,17 @@ class ControlScreen(Screen):
         # ── Control buttons ───────────────────────────────────────────────────
         brow = GridLayout(cols=3, size_hint_y=None, height=dp(52), spacing=dp(8))
         self._start_btn = Button(
-            text='▶ Start',
+            text='Start',
             background_color=GREEN, color=BG,
             font_size=dp(15), bold=True,
         )
         self._pause_btn = Button(
-            text='⏸ Pause',
+            text='Pause',
             background_color=SURFACE, color=MUTED,
             font_size=dp(13), disabled=True,
         )
         self._stop_btn = Button(
-            text='■ Stop',
+            text='Stop',
             background_color=SURFACE, color=MUTED,
             font_size=dp(13), disabled=True,
         )
@@ -243,7 +246,7 @@ class ControlScreen(Screen):
             btn.text = 'Dry Run  ON'
             btn.background_color = YELLOW[:3] + [1]
         else:
-            btn.text = 'Dry Run  OFF  ⚠'
+            btn.text = 'Dry Run  OFF (!)'
             btn.background_color = RED[:3] + [1]
 
     def _on_start(self, _):
@@ -259,7 +262,7 @@ class ControlScreen(Screen):
     # ── Public API called by the App ──────────────────────────────────────────
 
     def set_phase(self, phase: str):
-        dot, color, text, hint = PHASES.get(phase, ('●', MUTED, phase, ''))
+        dot, color, text, hint = PHASES.get(phase, ('•', MUTED, phase, ''))
         self._dot.text         = dot
         self._dot.color        = color
         self._status_text.text  = text
@@ -281,8 +284,8 @@ class ControlScreen(Screen):
 
     def update_progress(self, approved: int, failed: int):
         self._progress_lbl.text = (
-            f'[color=#a6e3a1]✓{approved}[/color]  '
-            f'[color=#f38ba8]✕{failed}[/color]'
+            f'[color=#a6e3a1]OK {approved}[/color]  '
+            f'[color=#f38ba8]Err {failed}[/color]'
         )
 
     def append_log(self, msg: str):
@@ -311,7 +314,7 @@ class BrowserScreen(Screen):
         self._app = app_ref
 
         back = Button(
-            text='◀ Control Panel',
+            text='< Control Panel',
             size_hint=(None, None),
             size=(dp(160), dp(44)),
             pos_hint={'right': 1, 'top': 1},
@@ -397,17 +400,17 @@ class FasloFasalApp(App):
         if self._paused:
             self.webview.resume_automation()
             self._paused = False
-            self._ctrl.set_pause_label('⏸ Pause')
+            self._ctrl.set_pause_label('Pause')
         else:
             self.webview.pause_automation()
             self._paused = True
-            self._ctrl.set_pause_label('▶ Resume')
+            self._ctrl.set_pause_label('Resume')
 
     def stop_automation(self):
         if self.webview:
             self.webview.stop_automation()
         self._paused = False
-        self._ctrl.set_pause_label('⏸ Pause')
+        self._ctrl.set_pause_label('Pause')
 
     # ── Callbacks from AndroidWebView (always arrive on Kivy main thread) ─────
 
@@ -436,7 +439,7 @@ class FasloFasalApp(App):
         content.add_widget(Label(
             text=(
                 'I am about to click\n'
-                '[b]REVIEW → Approve → Confirm → OK[/b]\n'
+                '[b]REVIEW -> Approve -> Confirm -> OK[/b]\n'
                 'on every record visible on screen.\n'
                 'Make sure you opened the right page first.'
             ),
@@ -475,11 +478,11 @@ class FasloFasalApp(App):
             self.show_control()
 
         yes_btn = Button(
-            text='✓  YES, START',
+            text='YES, START',
             background_color=GREEN, color=BG, bold=True,
         )
         no_btn = Button(
-            text='✕  NO, GO BACK',
+            text='NO, GO BACK',
             background_color=RED, color=BG,
         )
         yes_btn.bind(on_press=_yes)
