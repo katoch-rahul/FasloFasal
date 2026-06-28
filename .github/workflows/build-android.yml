@@ -99,6 +99,13 @@ jobs:
             "platforms;android-33" \
             "build-tools;33.0.2"
 
+          # Buildozer only probes the legacy "tools/bin/sdkmanager" location and
+          # ignores cmdline-tools/latest, so it reports "sdkmanager is not
+          # installed" and aborts. Symlinking the whole tools dir to
+          # cmdline-tools/latest satisfies that check and keeps the relative
+          # ../lib jar paths working.
+          ln -sfn "$SDK_ROOT/cmdline-tools/latest" "$SDK_ROOT/tools"
+
       - name: Build debug APK
         run: |
           set -o pipefail
