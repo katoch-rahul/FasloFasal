@@ -17,7 +17,7 @@ version = 1.2.0
 # ── Python requirements ────────────────────────────────────────────────────────
 # Do NOT add playwright, PySide6, or chromium — they have no Android recipes.
 # Kivy and pyjnius are sufficient; android is the python-for-android helper package.
-requirements = python3==3.11.6, kivy==2.3.0, pyjnius, android
+requirements = python3, kivy, pyjnius, android
 
 # ── Android-specific settings ──────────────────────────────────────────────────
 # Include our Java helper so Pyjnius can proxy WebViewClient / WebChromeClient
@@ -31,7 +31,7 @@ android.permissions = INTERNET, WRITE_EXTERNAL_STORAGE, READ_EXTERNAL_STORAGE
 android.minapi = 21
 android.api = 33
 android.sdk = 33
-android.ndk = 25b
+android.ndk = 28c
 
 # Build architectures (ARM64 for modern phones + ARM for older)
 android.archs = arm64-v8a, armeabi-v7a
