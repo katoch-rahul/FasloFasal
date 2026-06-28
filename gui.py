@@ -112,6 +112,26 @@ QPushButton#linkBtn {
 }
 QPushButton#linkBtn:hover { color: #b4befe; }
 
+QPushButton#uploadBtn {
+    background-color: #89b4fa;
+    color: #11111b;
+    font-size: 11pt;
+    font-weight: bold;
+    border-radius: 8px;
+    padding: 16px;
+}
+QPushButton#uploadBtn:hover { background-color: #b4befe; }
+QPushButton#uploadBtn:disabled { background-color: #45475a; color: #6c7086; }
+QPushButton#uploadBtnLoaded {
+    background-color: #a6e3a1;
+    color: #11111b;
+    font-size: 11pt;
+    font-weight: bold;
+    border-radius: 8px;
+    padding: 16px;
+}
+QPushButton#uploadBtnLoaded:hover { background-color: #94e2d5; }
+
 QCheckBox { spacing: 6px; padding: 2px; }
 QCheckBox::indicator { width: 14px; height: 14px; border-radius: 3px; border: 1px solid #6c7086; background: #1e1e2e; }
 QCheckBox::indicator:checked { background-color: #a6e3a1; border: 1px solid #a6e3a1; }
@@ -235,12 +255,21 @@ class ModuleConfirmationDialog(QDialog):
         title.setStyleSheet("font-size:13pt; font-weight:bold; color:#cba6f7;")
         v.addWidget(title)
 
-        # Friendly explainer
-        explainer = QLabel(
-            "I am about to start clicking <b>REVIEW → Approve → Confirm → OK</b> "
-            "on every record below.<br/><br/>"
-            "Please make sure you opened the right page before saying Yes."
-        )
+        # Friendly explainer — different wording for the two workflows
+        if self.require_excel:
+            explainer = QLabel(
+                "This is the <b>IS Claim — Add from Excel</b> page. For each claim "
+                "below I will open it, read its <b>Account No.</b>, find that account "
+                "in your Excel file, fill in the dates and amounts, then Save &amp; "
+                "Submit.<br/><br/>"
+                "First choose your Excel file below, then press Yes."
+            )
+        else:
+            explainer = QLabel(
+                "I am about to start clicking <b>REVIEW → Approve → Confirm → OK</b> "
+                "on every record below.<br/><br/>"
+                "Please make sure you opened the right page before saying Yes."
+            )
         explainer.setTextFormat(Qt.RichText)
         explainer.setWordWrap(True)
         explainer.setStyleSheet("color:#cdd6f4; font-size:10pt;")
@@ -297,27 +326,45 @@ class ModuleConfirmationDialog(QDialog):
         v.addLayout(h)
 
     def _build_excel_section(self) -> QFrame:
+        # Prominent "drop-zone" style card so this required step can't be missed.
         box = QFrame()
         box.setStyleSheet(
-            "background:#1e1e2e; border-radius:6px; border-left:4px solid #89b4fa;"
+            "QFrame { background:#11192b; border:2px dashed #89b4fa; "
+            "border-radius:10px; }"
         )
         bv = QVBoxLayout(box)
-        bv.setContentsMargins(12, 10, 12, 10)
-        bv.setSpacing(6)
+        bv.setContentsMargins(16, 16, 16, 16)
+        bv.setSpacing(8)
 
-        head = QLabel("📄  This page needs your IS-claim Excel file")
-        head.setStyleSheet("color:#89b4fa; font-size:10pt; font-weight:bold;")
+        head = QLabel("📄  Required — your IS-claim Excel file")
+        head.setStyleSheet(
+            "color:#89b4fa; font-size:11pt; font-weight:bold; border:none;"
+        )
         bv.addWidget(head)
 
-        self.upload_btn = QPushButton("📁  Choose Excel file…")
-        self.upload_btn.setObjectName("pauseBtn")
-        self.upload_btn.setFixedHeight(36)
+        why = QLabel(
+            "The tool reads each claim's <b>Account No.</b> from the website and "
+            "looks up the dates and amounts to enter from this file. Pick the "
+            "workbook for this financial year to continue."
+        )
+        why.setTextFormat(Qt.RichText)
+        why.setWordWrap(True)
+        why.setStyleSheet("color:#cdd6f4; font-size:9pt; border:none;")
+        bv.addWidget(why)
+
+        self.upload_btn = QPushButton("📁   Choose Excel file…")
+        self.upload_btn.setObjectName("uploadBtn")
+        self.upload_btn.setMinimumHeight(56)
+        self.upload_btn.setCursor(Qt.PointingHandCursor)
         self.upload_btn.clicked.connect(self._choose_excel)
         bv.addWidget(self.upload_btn)
 
-        self.excel_status = QLabel("No file chosen yet.")
+        self.excel_status = QLabel("No file chosen yet — choose your .xlsx file above.")
         self.excel_status.setWordWrap(True)
-        self.excel_status.setStyleSheet("color:#a6adc8; font-size:9pt;")
+        self.excel_status.setAlignment(Qt.AlignCenter)
+        self.excel_status.setStyleSheet(
+            "color:#a6adc8; font-size:9pt; border:none;"
+        )
         bv.addWidget(self.excel_status)
         return box
 
@@ -327,10 +374,10 @@ class ModuleConfirmationDialog(QDialog):
         )
         if not path:
             return
-        self.upload_btn.setText("Loading…")
+        self.upload_btn.setText("⏳   Loading…")
         self.upload_btn.setEnabled(False)
         self.excel_status.setText("Reading workbook, please wait…")
-        self.excel_status.setStyleSheet("color:#a6adc8; font-size:9pt;")
+        self.excel_status.setStyleSheet("color:#a6adc8; font-size:9pt; border:none;")
         QApplication.processEvents()
         try:
             # imported lazily so launching the GUI doesn't pull in pandas
@@ -340,8 +387,9 @@ class ModuleConfirmationDialog(QDialog):
             self.excel_path = None
             self.lookup = None
             self.excel_status.setText(f"✕  Could not read this file:\n{e}")
-            self.excel_status.setStyleSheet("color:#f38ba8; font-size:9pt; font-weight:bold;")
-            self.upload_btn.setText("📁  Choose Excel file…")
+            self.excel_status.setStyleSheet("color:#f38ba8; font-size:9pt; font-weight:bold; border:none;")
+            self._set_upload_btn_style("uploadBtn")
+            self.upload_btn.setText("📁   Choose Excel file…")
             self.upload_btn.setEnabled(True)
             self.confirm_btn.setEnabled(False)
             return
@@ -351,10 +399,18 @@ class ModuleConfirmationDialog(QDialog):
         name = Path(path).name
         dup = f" ({len(lookup.duplicates)} duplicate accounts ignored)" if lookup.duplicates else ""
         self.excel_status.setText(f"✓  {name}\n{lookup.count} accounts loaded{dup}")
-        self.excel_status.setStyleSheet("color:#a6e3a1; font-size:9pt; font-weight:bold;")
-        self.upload_btn.setText("📁  Change file…")
+        self.excel_status.setStyleSheet("color:#a6e3a1; font-size:9pt; font-weight:bold; border:none;")
+        self._set_upload_btn_style("uploadBtnLoaded")
+        self.upload_btn.setText("✓   File loaded — change file…")
         self.upload_btn.setEnabled(True)
         self.confirm_btn.setEnabled(True)
+
+    def _set_upload_btn_style(self, object_name: str):
+        """Swap the upload button's object name and re-polish so the matching
+        stylesheet rule (blue 'choose' vs green 'loaded') takes effect."""
+        self.upload_btn.setObjectName(object_name)
+        self.upload_btn.style().unpolish(self.upload_btn)
+        self.upload_btn.style().polish(self.upload_btn)
 
     def _on_confirm(self):
         # Defensive: never allow confirming the IS flow without a loaded workbook.
@@ -1187,9 +1243,14 @@ class ClaimApproverGUI(QMainWindow):
             "<div style='font-size:13pt; font-weight:bold; color:#cba6f7;'>"
             "What does this tool do?</div>"
             "<div style='font-size:10pt; color:#cdd6f4; margin-top:6px;'>"
-            "It clicks the same buttons you click on the website — "
-            "<b>REVIEW</b>, then <b>Approve</b>, then <b>Confirm</b>, then <b>OK</b> — "
-            "for every record, one by one, until all are done."
+            "It does your repetitive clicking for you, one record at a time, "
+            "until the whole list is finished. It can do <b>two jobs</b>:"
+            "<br/><br/>"
+            "<b>1. Approve / Verify</b> — clicks <b>REVIEW → Approve → "
+            "Confirm → OK</b> on every record.<br/><br/>"
+            "<b>2. Add IS Claims from Excel</b> — opens each claim, reads its "
+            "account number, finds that account in <b>your Excel file</b>, fills "
+            "in the dates and amounts, ticks the declaration, and submits it."
             "</div>"
         )
         what.setTextFormat(Qt.RichText)
@@ -1202,15 +1263,47 @@ class ClaimApproverGUI(QMainWindow):
             "<div style='font-size:11pt; font-weight:bold; color:#a6e3a1;'>"
             "✓ Works on these pages:</div>"
             "<div style='font-size:10pt; color:#cdd6f4; margin-top:4px; line-height:1.5;'>"
+            "<b>Approve / Verify</b><br/>"
             "&nbsp;&nbsp;• Loan Application Verification<br/>"
             "&nbsp;&nbsp;• PRI Claim Verification<br/>"
-            "&nbsp;&nbsp;• IS Claim Verification"
+            "&nbsp;&nbsp;• IS Claim Verification<br/><br/>"
+            "<b>Add from Excel</b><br/>"
+            "&nbsp;&nbsp;• IS Claim list (rows with an <b>Add</b> button)"
             "</div>"
         )
         works.setTextFormat(Qt.RichText)
         works.setWordWrap(True)
         works.setStyleSheet("padding:12px; background:#1e1e2e; border-radius:6px;")
         v.addWidget(works)
+
+        # ── New: Add IS Claims from Excel ─────────────────────────────
+        is_excel = QLabel(
+            "<div style='font-size:11pt; font-weight:bold; color:#89b4fa;'>"
+            "🆕 Adding IS Claims from Excel</div>"
+            "<div style='font-size:10pt; color:#cdd6f4; margin-top:4px; line-height:1.5;'>"
+            "When you open the <b>IS Claim</b> list where each row has an "
+            "<b>Add</b> button, the tool switches to data-entry mode:"
+            "<br/><br/>"
+            "&nbsp;&nbsp;1. The pop-up asks you to <b>choose your IS-claim "
+            "Excel file</b>.<br/>"
+            "&nbsp;&nbsp;2. For each claim it reads the <b>Account No.</b> and "
+            "finds that row in your file.<br/>"
+            "&nbsp;&nbsp;3. It fills the dates and amounts, ticks the "
+            "declaration, and submits.<br/>"
+            "&nbsp;&nbsp;4. Accounts not found in your file are skipped and "
+            "noted in the Log."
+            "<br/><br/>"
+            "<span style='color:#a6adc8; font-size:9pt;'>Your Excel file stays "
+            "on your computer — it is never uploaded or saved by this tool.</span>"
+            "</div>"
+        )
+        is_excel.setTextFormat(Qt.RichText)
+        is_excel.setWordWrap(True)
+        is_excel.setStyleSheet(
+            "padding:12px; background:#11192b; border-radius:6px; "
+            "border-left:4px solid #89b4fa;"
+        )
+        v.addWidget(is_excel)
 
         # ── How to use it ─────────────────────────────────────────────
         how_title = QLabel("<b style='font-size:13pt; color:#cba6f7;'>How to use it — step by step</b>")
@@ -1229,7 +1322,7 @@ class ClaimApproverGUI(QMainWindow):
             ("5", "Click the green <b>PROCEED</b> button on the website.",
                   "Wait a few seconds — the list of records will appear."),
             ("6", "A small box will pop up asking <b>“Yes, Start”</b> or <b>“No, Go Back”</b>.",
-                  "It will tell you which page you are on. Read it carefully, then click <b>YES, START</b> if everything looks correct."),
+                  "It tells you which page you are on. On the <b>IS Claim Add</b> page it also asks you to <b>choose your Excel file</b> first. Read it carefully, then click <b>YES, START</b> if everything looks correct."),
             ("7", "Sit back. The tool will do the rest by itself.",
                   "You will see green ticks (✓) for every record done. Don't touch the browser while it is working."),
             ("8", "When you see <b>“Finished”</b> at the top, the work is done.",
