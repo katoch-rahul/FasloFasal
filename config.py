@@ -24,6 +24,18 @@ DELAY_BETWEEN_RECORDS_SEC = 0.5
 MANUAL_SETUP_TIMEOUT_SEC = 180
 LIST_REFRESH_TIMEOUT_MS = 15_000
 
+# ── Reliability / resilience ──────────────────────────────────────────────────
+# A single bad row shouldn't stop the whole run, but a long failure *streak*
+# means something is genuinely wrong (session dropped, portal changed) — better
+# to stop cleanly than to spin forever. High enough to ride out transient blips,
+# low enough not to hammer the portal.
+MAX_CONSECUTIVE_FAILURES = 6
+# Substring marking a "logged in, on the work list" URL. If the actionable
+# buttons disappear AND the URL no longer contains this, we treat it as a
+# dropped session and wait for the user to log back in — instead of wrongly
+# reporting the run as finished.
+SESSION_LIST_URL_HINT = "application-list"
+
 SELECTORS = {
     "review_button": 'a:has-text("REVIEW"), button:has-text("REVIEW")',
     "approve_button": 'button:has-text("Approve"), button:has-text("APPROVE")',

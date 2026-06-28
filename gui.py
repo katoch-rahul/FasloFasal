@@ -442,6 +442,10 @@ class AutomationWorker(QThread):
         self.flow        = "approval"   # "approval" (REVIEW) or "is_fill" (Add)
         self.lookup      = None         # ISClaimLookup, set for the is_fill flow
         self._is_form_dumped = False    # dump the IS form DOM once per run for tuning
+        self.consecutive_failures = 0   # reliability: trip the breaker on a streak
+        self.skipped_accounts = set()   # IS-fill (live): rows we couldn't process
+        self._dry_cursor = 0            # per-page row index for dry-run walks
+        self._aborted = False           # True if the run stopped on an error
 
     def set_lookup(self, lookup):
         """Called by the GUI after the user uploads the IS-claim Excel."""
@@ -549,49 +553,102 @@ class AutomationWorker(QThread):
             self._log("[ERROR] Timed out — did you select a module and click PROCEED?")
             raise
 
-    def _wait_for_review_or_paginate(self, page: Page) -> bool:
+    # ── reliability helpers ──────────────────────────────────────────────────
+    def _session_alive(self, page: Page) -> bool:
+        """True while we're still on a work list (i.e. logged in). When the
+        actionable buttons vanish, this tells 'finished' apart from 'session
+        dropped / logged out'."""
+        try:
+            return config.SESSION_LIST_URL_HINT in (page.url or "")
+        except Exception:
+            return False
+
+    def _too_many_failures(self) -> bool:
+        """Count one more failure; return True (and log) once the run has failed
+        too many times back-to-back — our guard against spinning forever."""
+        self.consecutive_failures += 1
+        cap = config.MAX_CONSECUTIVE_FAILURES
+        if self.consecutive_failures >= cap:
+            self._log(f"[ERROR] {self.consecutive_failures} failures in a row — "
+                      "stopping. Check the browser (session/login/portal), then "
+                      "Start again.")
+            self._aborted = True
+            return True
+        self._log(f"[WARN] Failure {self.consecutive_failures}/{cap} in a row — "
+                  "retrying…")
+        return False
+
+    def _try_next_page(self, page: Page, action_sel: str) -> bool:
+        """Advance to the next page of results. True if a next page loaded with
+        actionable rows; False if there is no enabled next page."""
+        next_btn = page.locator(config.SELECTORS["next_page_button"])
+        try:
+            if (next_btn.count() > 0 and next_btn.first.is_visible()
+                    and next_btn.first.is_enabled()):
+                self._log("[INFO] Next page…")
+                next_btn.first.click(timeout=self.settings["per_record_timeout"])
+                page.wait_for_timeout(2000)
+                page.wait_for_selector(
+                    action_sel,
+                    timeout=self.settings["list_refresh_timeout"],
+                    state="visible",
+                )
+                return True
+        except Exception as e:
+            self._log(f"[INFO] No more pages ({e}).")
+        return False
+
+    def _actionable_or_paginate(self, page: Page, action_sel: str) -> bool:
+        """True if actionable rows are present now, or after turning the page."""
         try:
             page.wait_for_selector(
-                config.SELECTORS["review_button"],
+                action_sel,
                 timeout=self.settings["list_refresh_timeout"],
                 state="visible",
             )
             return True
         except PlaywrightTimeoutError:
             pass
+        return self._try_next_page(page, action_sel)
 
-        next_btn = page.locator(config.SELECTORS["next_page_button"])
+    def _wait_for_relogin(self, page: Page, action_sel: str) -> bool:
+        """The session looks dropped (buttons gone, no longer on a work list).
+        Wait for the user to log back in and click PROCEED again, then resume.
+        True if the table came back; False on timeout or if the user stopped."""
+        self._log("[WARN] You appear to be logged out or the session expired.")
+        self._log("[INFO] Log back in and click PROCEED again — I'll wait and "
+                  "carry on automatically.")
+        self.phase_signal.emit("waiting")
         try:
-            if next_btn.count() > 0:
-                btn_first = next_btn.first
-                is_visible = btn_first.is_visible()
-                self._log(f"[DEBUG] Next button: visible={is_visible}, enabled={btn_first.is_enabled()}")
-                if is_visible:
-                    self._log("[INFO] Next page…")
-                    btn_first.click(timeout=self.settings["per_record_timeout"])
-                    page.wait_for_timeout(2000)
-                    page.wait_for_selector(
-                        config.SELECTORS["review_button"],
-                        timeout=self.settings["list_refresh_timeout"],
-                        state="visible",
-                    )
-                    return True
-        except Exception as e:
-            self._log(f"[INFO] Pagination failed: {e}")
-            try:
-                btns = page.locator("button, a").all()
-                texts = [b.inner_text().strip() for b in btns if b.inner_text().strip()]
-                self._log(f"[DEBUG] Buttons/links on page: {texts}")
-            except Exception:
-                pass
-            html_file = config.LOGS_DIR / "page_dump_pagination_failed.html"
-            try:
-                with open(html_file, "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                self._log(f"[DEBUG] Page HTML saved: {html_file}")
-            except Exception:
-                pass
-        return False
+            page.wait_for_selector(
+                action_sel,
+                timeout=self.settings["manual_timeout"] * 1000,
+                state="visible",
+            )
+        except PlaywrightTimeoutError:
+            self._log("[ERROR] Session did not come back in time — stopping.")
+            self._aborted = True
+            return False
+        if not self.is_running:
+            return False
+        page.wait_for_timeout(1000)
+        self.phase_signal.emit("running")
+        self._log("[OK] Back online — continuing where we left off.")
+        return True
+
+    def _wait_actionable(self, page: Page, action_sel: str) -> bool:
+        """Ensure actionable rows are available, transparently handling
+        pagination and a dropped session. False only when the work is genuinely
+        finished (or the run was stopped)."""
+        if self._actionable_or_paginate(page, action_sel):
+            return True
+        # No rows and no next page: truly done, or did the session drop?
+        if self._session_alive(page):
+            return False
+        return self._wait_for_relogin(page, action_sel)
+
+    def _wait_for_review_or_paginate(self, page: Page) -> bool:
+        return self._wait_actionable(page, config.SELECTORS["review_button"])
 
     def _screenshot(self, page: Page, label: str) -> str:
         path = config.LOGS_DIR / f"error_{label}_{int(time.time())}.png"
@@ -639,15 +696,28 @@ class AutomationWorker(QThread):
 
         btns = page.locator(config.SELECTORS["review_button"])
         n = btns.count()
+        if n == 0:
+            return "no_more_records"
         self._log(f"[{index}] {n} REVIEW button(s) visible.")
 
         if self.settings["dry_run"]:
-            self._log(f"[{index}] DRY RUN — REVIEW only…")
-            btns.nth(index).click(timeout=self.settings["per_record_timeout"])
+            # Dry run approves nothing, so rows never disappear — walk them by a
+            # per-page cursor and turn the page once this one is exhausted.
+            if self._dry_cursor >= n:
+                if not self._try_next_page(page, config.SELECTORS["review_button"]):
+                    return "no_more_records"
+                self._dry_cursor = 0
+                btns = page.locator(config.SELECTORS["review_button"])
+                n = btns.count()
+                if n == 0:
+                    return "no_more_records"
+            self._log(f"[{index}] DRY RUN — REVIEW only (row {self._dry_cursor + 1}/{n})…")
+            btns.nth(self._dry_cursor).click(timeout=self.settings["per_record_timeout"])
             page.wait_for_timeout(800)
             page.go_back(wait_until="domcontentloaded")
             page.wait_for_timeout(800)
             self._log_record(writer, index, "dry_run_review_clicked", "")
+            self._dry_cursor += 1
             return "ok"
 
         self._log(f"[{index}] REVIEW…")
@@ -709,7 +779,7 @@ class AutomationWorker(QThread):
                         pass
 
         self._log(f"[DONE] ✓{self.approved} ✕{self.failed}")
-        self.phase_signal.emit("done")
+        self.phase_signal.emit("error" if self._aborted else "done")
         self.finished_signal.emit(self.approved, self.failed)
 
     # ── approval flow (REVIEW → Approve → Confirm → OK) ──────────────────────
@@ -733,6 +803,7 @@ class AutomationWorker(QThread):
                         self._log("[INFO] No more records.")
                     break
                 self.approved += 1
+                self.consecutive_failures = 0
                 self.progress_signal.emit(self.approved, self.failed)
                 self._log(f"[OK] Record {i} done. (Total: {self.approved})")
             except PlaywrightTimeoutError as e:
@@ -742,6 +813,8 @@ class AutomationWorker(QThread):
                 f.flush()
                 self.progress_signal.emit(self.approved, self.failed)
                 self._log(f"[ERROR] Timeout on {i}. {shot}")
+                if self._too_many_failures():
+                    break
                 self._recover(page)
             except Exception as e:
                 self.failed += 1
@@ -750,6 +823,8 @@ class AutomationWorker(QThread):
                 f.flush()
                 self.progress_signal.emit(self.approved, self.failed)
                 self._log(f"[ERROR] Record {i}: {e}")
+                if self._too_many_failures():
+                    break
                 self._recover(page)
 
             time.sleep(self.settings["delay_between_records"])
@@ -783,13 +858,25 @@ class AutomationWorker(QThread):
                 if result == "no_more":
                     self._log("[INFO] No more rows to process.")
                     break
+                if result == "blocked":
+                    self._log("[ERROR] A row that can't be auto-filled is blocking "
+                              "the queue. Add that account to your Excel or process "
+                              "it by hand on the portal, then Start again.")
+                    self._aborted = True
+                    break
                 if result in ("filled", "dry"):
                     self.approved += 1
+                    self.consecutive_failures = 0
                     self.progress_signal.emit(self.approved, self.failed)
                     self._log(f"[OK] Row {i} done. (Total: {self.approved})")
                 elif result == "skip":
                     self.failed += 1
                     self.progress_signal.emit(self.approved, self.failed)
+                    # In live mode a skipped row stays at the top of the queue;
+                    # a streak of skips means we're stuck. Dry-run skips are
+                    # genuine progress (the cursor advanced), so don't count them.
+                    if not dry and self._too_many_failures():
+                        break
             except PlaywrightTimeoutError as e:
                 self.failed += 1
                 shot = self._screenshot(page, f"is_timeout_{i}")
@@ -797,6 +884,8 @@ class AutomationWorker(QThread):
                 f.flush()
                 self.progress_signal.emit(self.approved, self.failed)
                 self._log(f"[ERROR] Timeout on row {i}. {shot}")
+                if self._too_many_failures():
+                    break
                 self._is_recover(page)
             except Exception as e:
                 self.failed += 1
@@ -805,47 +894,39 @@ class AutomationWorker(QThread):
                 f.flush()
                 self.progress_signal.emit(self.approved, self.failed)
                 self._log(f"[ERROR] Row {i}: {e}")
+                if self._too_many_failures():
+                    break
                 self._is_recover(page)
 
             time.sleep(self.settings["delay_between_records"])
 
     def _wait_for_add_or_paginate(self, page: Page) -> bool:
-        try:
-            page.wait_for_selector(
-                config.IS_CLAIM_SELECTORS["add_button"],
-                timeout=self.settings["list_refresh_timeout"],
-                state="visible",
-            )
-            return True
-        except PlaywrightTimeoutError:
-            pass
-        next_btn = page.locator(config.SELECTORS["next_page_button"])
-        try:
-            if next_btn.count() > 0 and next_btn.first.is_visible():
-                self._log("[INFO] Next page…")
-                next_btn.first.click(timeout=self.settings["per_record_timeout"])
-                page.wait_for_timeout(2000)
-                page.wait_for_selector(
-                    config.IS_CLAIM_SELECTORS["add_button"],
-                    timeout=self.settings["list_refresh_timeout"],
-                    state="visible",
-                )
-                return True
-        except Exception as e:
-            self._log(f"[INFO] Pagination failed: {e}")
-        return False
+        return self._wait_actionable(page, config.IS_CLAIM_SELECTORS["add_button"])
 
     def _fill_one_is_claim(self, page: Page, writer, index: int, dry: bool) -> str:
         if not self._wait_for_add_or_paginate(page):
             return "no_more"
         add_btns = page.locator(config.IS_CLAIM_SELECTORS["add_button"])
         n = add_btns.count()
-        # In dry run nothing is submitted, so rows don't disappear — step through
-        # them by index. Live runs always take the first remaining row.
-        if dry and index >= n:
+        if n == 0:
             return "no_more"
+        if dry:
+            # Dry run submits nothing, so rows never disappear — walk them by a
+            # per-page cursor and turn the page once this one is exhausted.
+            if self._dry_cursor >= n:
+                if not self._try_next_page(page, config.IS_CLAIM_SELECTORS["add_button"]):
+                    return "no_more"
+                self._dry_cursor = 0
+                add_btns = page.locator(config.IS_CLAIM_SELECTORS["add_button"])
+                n = add_btns.count()
+                if n == 0:
+                    return "no_more"
+            target = add_btns.nth(self._dry_cursor)
+        else:
+            # Live runs always take the first remaining row (processed rows drop
+            # off the list after submit).
+            target = add_btns.first
         self._log(f"[{index}] {n} Add button(s) visible.")
-        target = add_btns.nth(index) if dry else add_btns.first
         target.click(timeout=self.settings["per_record_timeout"])
         page.wait_for_timeout(1200)
 
@@ -854,13 +935,28 @@ class AutomationWorker(QThread):
             self._log(f"[{index}] [WARN] Couldn't read Account No. from the form.")
             self._log_record(writer, index, "no_account", "account header not found")
             self._is_back_to_list(page)
+            if dry:
+                self._dry_cursor += 1
             return "skip"
+
+        # Live: a row we already gave up on is still sitting at the top of the
+        # queue (the portal gives us no way to remove it). Re-skipping it forever
+        # would stall the whole run — recognise the repeat and stop cleanly.
+        if not dry and account in self.skipped_accounts:
+            self._log(f"[{index}] [ERROR] Account {self._mask(account)} can't be "
+                      "processed and is blocking the queue.")
+            self._is_back_to_list(page)
+            return "blocked"
 
         rec = self.lookup.get(account)
         if rec is None:
             self._log(f"[{index}] [WARN] Account {self._mask(account)} not in Excel — skipping.")
             self._log_record(writer, index, "not_in_excel", "", account=account)
             self._is_back_to_list(page)
+            if dry:
+                self._dry_cursor += 1
+            else:
+                self.skipped_accounts.add(account)
             return "skip"
 
         self._log(f"[{index}] Account {self._mask(account)} matched — filling…")
@@ -871,6 +967,7 @@ class AutomationWorker(QThread):
             self._log(f"[{index}] DRY RUN — filled, not saving. Returning to list.")
             self._log_record(writer, index, "dry_run_filled", "", account=account)
             self._is_back_to_list(page)
+            self._dry_cursor += 1
             return "dry"
 
         # LIVE: Save & Continue → review → Submit
@@ -1409,7 +1506,9 @@ class ClaimApproverGUI(QMainWindow):
             "<div style='font-size:10pt; color:#cdd6f4; margin-top:4px; line-height:1.5;'>"
             "• Always read the popup carefully before clicking <b>YES, START</b>.<br/>"
             "• Do not move your mouse or use the browser while the tool is working.<br/>"
-            "• If something looks wrong, click <b>■ Stop</b> immediately."
+            "• If something looks wrong, click <b>■ Stop</b> immediately.<br/>"
+            "• If you get logged out mid-run, just log back in and click "
+            "<b>PROCEED</b> again — the tool waits and carries on by itself."
             "</div>"
         )
         safety.setTextFormat(Qt.RichText)
