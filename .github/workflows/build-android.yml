@@ -90,7 +90,10 @@ jobs:
           fi
 
           # Accept all licenses (idempotent) and install the packages buildozer needs.
-          yes | "$SDK_MGR" --sdk_root="$SDK_ROOT" --licenses >/dev/null
+          # sdkmanager closes the pipe once it has read enough "y" answers, so `yes`
+          # exits with a broken pipe; `|| true` keeps that from failing the step
+          # under `set -o pipefail`. Licenses are still accepted.
+          yes | "$SDK_MGR" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
           "$SDK_MGR" --sdk_root="$SDK_ROOT" \
             "platform-tools" \
             "platforms;android-33" \
