@@ -373,10 +373,14 @@ class FasloFasalApp(App):
     # ── Navigation ────────────────────────────────────────────────────────────
 
     def show_browser(self):
+        if self.webview:
+            self.webview.show()
         self.root.current = 'browser'
 
     def show_control(self):
         self.root.current = 'control'
+        if self.webview:
+            self.webview.hide()
 
     # ── Automation control ────────────────────────────────────────────────────
 

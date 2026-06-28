@@ -107,6 +107,7 @@ if platform == 'android':
     _WebSettings    = autoclass('android.webkit.WebSettings')
     _FrameLayoutLP  = autoclass('android.widget.FrameLayout$LayoutParams')
     _Gravity        = autoclass('android.view.Gravity')
+    _View           = autoclass('android.view.View')
     _CookieManager  = autoclass('android.webkit.CookieManager')
     _PythonActivity = autoclass('org.kivy.android.PythonActivity')
     _WVCallbacks    = autoclass('org.faslofasal.WebViewCallbacks')
@@ -226,6 +227,27 @@ class AndroidWebView:
 
         _destroy_on_ui_thread()
 
+    def show(self):
+        """Make the WebView visible (covers the Kivy control panel)."""
+        self._set_visibility(True)
+
+    def hide(self):
+        """Hide the WebView so the Kivy control panel shows through."""
+        self._set_visibility(False)
+
+    def _set_visibility(self, visible: bool):
+        if platform != 'android' or not self._webview:
+            return
+
+        @run_on_ui_thread
+        def _apply():
+            if self._webview:
+                self._webview.setVisibility(
+                    _View.VISIBLE if visible else _View.GONE
+                )
+
+        _apply()
+
     # ── Private UI-thread methods ─────────────────────────────────────────────
 
     def _do_create(self):
@@ -267,8 +289,12 @@ class AndroidWebView:
         activity.addContentView(self._webview, params)
 
         self._webview.loadUrl(cfg.LIST_URL)
-        self._log('[INFO] Browser opened. Log in and click PROCEED on the portal.')
-        self._emit_phase('waiting')
+        # The WebView fills the whole screen and sits on top of the Kivy
+        # surface. Keep it hidden until the user opens the browser, otherwise it
+        # covers the control panel on launch (appears as a blank white screen).
+        self._webview.setVisibility(_View.GONE)
+        self._log('[INFO] Ready. Tap Start, then log in and click PROCEED.')
+        self._emit_phase('idle')
 
     def _do_destroy(self):
         if self._webview:
@@ -495,6 +521,7 @@ class AndroidWebView:
 
         # Wait for user to navigate to the portal and select a module
         self._log('[INFO] Waiting for you to log in and click PROCEED…')
+        self._emit_phase('waiting')
         manual_timeout = self._settings.get('manual_timeout', cfg.MANUAL_SETUP_TIMEOUT_SEC)
         deadline = time.monotonic() + manual_timeout
 
