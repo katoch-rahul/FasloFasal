@@ -107,6 +107,7 @@ if platform == 'android':
     _WebSettings    = autoclass('android.webkit.WebSettings')
     _FrameLayoutLP  = autoclass('android.widget.FrameLayout$LayoutParams')
     _Gravity        = autoclass('android.view.Gravity')
+    _View           = autoclass('android.view.View')
     _CookieManager  = autoclass('android.webkit.CookieManager')
     _PythonActivity = autoclass('org.kivy.android.PythonActivity')
     _WVCallbacks    = autoclass('org.faslofasal.WebViewCallbacks')
@@ -114,6 +115,11 @@ if platform == 'android':
 
     class _PyPageListener(PythonJavaClass):
         __javainterfaces__ = ['org/faslofasal/WebViewCallbacks$PageListener']
+        # Use the *application* class loader, not the system one. Our interface
+        # (org.faslofasal.*) is bundled via android.add_src and is only visible
+        # to the app loader; the default 'system' context raises
+        # "interface ... is not visible from class loader" when the proxy is built.
+        __javacontext__ = 'app'
 
         def __init__(self, on_started: Callable, on_finished: Callable):
             super().__init__()
@@ -130,6 +136,8 @@ if platform == 'android':
 
     class _PyConsoleListener(PythonJavaClass):
         __javainterfaces__ = ['org/faslofasal/WebViewCallbacks$ConsoleListener']
+        # See _PyPageListener: app class loader is required for our add_src interface.
+        __javacontext__ = 'app'
 
         def __init__(self, handler: Callable):
             super().__init__()
@@ -186,21 +194,59 @@ class AndroidWebView:
     # ── WebView lifecycle (must be called from Kivy/UI thread) ───────────────
 
     def create(self, settings: dict):
-        """Create WebView and attach to Activity. Call from UI thread."""
+        """Create WebView and attach to Activity.
+
+        Android requires that Views (and the WebView in particular) are created
+        and touched only on the Android UI thread. Under Kivy, Python code runs
+        on a *separate* thread, so we must hop onto the UI thread explicitly —
+        otherwise WebView construction throws and the app shows an error.
+        """
         if platform != 'android':
             self._log('[WARN] create() called on non-Android platform — skipped.')
             return
         self._settings = settings
-        try:
-            self._do_create()
-        except Exception as exc:
-            self._log(f'[ERROR] WebView creation failed: {exc}')
-            self._emit_phase('error')
+
+        @run_on_ui_thread
+        def _create_on_ui_thread():
+            try:
+                self._do_create()
+            except Exception as exc:
+                self._log(f'[ERROR] WebView creation failed: {exc!r}')
+                self._emit_phase('error')
+
+        _create_on_ui_thread()
 
     def destroy(self):
-        """Detach and destroy WebView. Call from UI thread."""
-        if platform == 'android':
+        """Detach and destroy WebView (hops onto the Android UI thread)."""
+        if platform != 'android':
+            return
+
+        @run_on_ui_thread
+        def _destroy_on_ui_thread():
             self._do_destroy()
+
+        _destroy_on_ui_thread()
+
+    def show(self):
+        """Make the WebView visible (covers the Kivy control panel)."""
+        self._set_visibility(True)
+
+    def hide(self):
+        """Hide the WebView so the Kivy control panel shows through."""
+        self._set_visibility(False)
+
+    def _set_visibility(self, visible: bool):
+        if platform != 'android' or not self._webview:
+            return
+
+        @run_on_ui_thread
+        def _apply():
+            if self._webview:
+                self._webview.setVisibility(
+                    _View.VISIBLE if visible else _View.GONE
+                )
+
+        _apply()
 
     # ── Private UI-thread methods ─────────────────────────────────────────────
 
@@ -243,8 +289,12 @@ class AndroidWebView:
         activity.addContentView(self._webview, params)
 
         self._webview.loadUrl(cfg.LIST_URL)
-        self._log('[INFO] Browser opened. Log in and click PROCEED on the portal.')
-        self._emit_phase('waiting')
+        # The WebView fills the whole screen and sits on top of the Kivy
+        # surface. Keep it hidden until the user opens the browser, otherwise it
+        # covers the control panel on launch (appears as a blank white screen).
+        self._webview.setVisibility(_View.GONE)
+        self._log('[INFO] Ready. Tap Start, then log in and click PROCEED.')
+        self._emit_phase('idle')
 
     def _do_destroy(self):
         if self._webview:
@@ -260,21 +310,21 @@ class AndroidWebView:
     # ── JS execution ─────────────────────────────────────────────────────────
 
     def _exec_js_fire(self, code: str):
-        """Fire-and-forget JS. Safe to call from UI thread or background thread."""
+        """Fire-and-forget JS. Safe to call from any thread.
+
+        evaluateJavascript must run on the Android UI thread. Kivy's "main"
+        thread is NOT that thread, so we always post onto the UI thread via
+        run_on_ui_thread (which runs inline if we happen to already be on it).
+        """
         if not self._webview or platform != 'android':
             return
-        if threading.current_thread() is threading.main_thread():
-            # Already on UI thread — execute directly
-            self._webview.evaluateJavascript(code, None)
-        else:
-            done = threading.Event()
 
-            def _run():
+        @run_on_ui_thread
+        def _run():
+            if self._webview:
                 self._webview.evaluateJavascript(code, None)
-                done.set()
 
-            run_on_ui_thread(_run)()
-            done.wait(timeout=5.0)
+        _run()
 
     def _js_eval(self, expr: str, timeout: float = 8.0) -> Optional[str]:
         """Evaluate JS expression and return result (background thread only).
@@ -301,9 +351,8 @@ class AndroidWebView:
         self._page_loaded.clear()
 
     def _handle_page_finished(self, url: str):
-        # Inject helpers — fire-and-forget, we're on UI thread
-        if self._webview and platform == 'android':
-            self._webview.evaluateJavascript(_JS_HELPERS, None)
+        # Inject helpers — fire-and-forget on the Android UI thread.
+        self._exec_js_fire(_JS_HELPERS)
         self._page_loaded.set()
 
     def _handle_console(self, payload: str):
@@ -399,7 +448,7 @@ class AndroidWebView:
             self._wait_page_load(8.0)
             return 'ok'
 
-        self._log(f'[{index}] REVIEW → Approve → Confirm → OK…')
+        self._log(f'[{index}] REVIEW -> Approve -> Confirm -> OK...')
         if not self._click(cfg.BUTTON_TEXTS['review']):
             self._log(f'[{index}] Could not click REVIEW.')
             return 'error'
@@ -472,6 +521,7 @@ class AndroidWebView:
 
         # Wait for user to navigate to the portal and select a module
         self._log('[INFO] Waiting for you to log in and click PROCEED…')
+        self._emit_phase('waiting')
         manual_timeout = self._settings.get('manual_timeout', cfg.MANUAL_SETUP_TIMEOUT_SEC)
         deadline = time.monotonic() + manual_timeout
 
