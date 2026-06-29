@@ -446,6 +446,7 @@ class AutomationWorker(QThread):
         self.skipped_accounts = set()   # IS-fill (live): rows we couldn't process
         self._dry_cursor = 0            # per-page row index for dry-run walks
         self._aborted = False           # True if the run stopped on an error
+        self.anomalies = []             # IS-fill: rows where Applicable IS was capped
 
     def set_lookup(self, lookup):
         """Called by the GUI after the user uploads the IS-claim Excel."""
@@ -778,6 +779,7 @@ class AutomationWorker(QThread):
                     except Exception:
                         pass
 
+        self._write_anomalies()
         self._log(f"[DONE] ✓{self.approved} ✕{self.failed}")
         self.phase_signal.emit("error" if self._aborted else "done")
         self.finished_signal.emit(self.approved, self.failed)
@@ -961,7 +963,7 @@ class AutomationWorker(QThread):
 
         self._log(f"[{index}] Account {self._mask(account)} matched — filling…")
         self._dump_form_html(page)
-        self._fill_is_form(page, rec)
+        self._fill_is_form(page, rec, account)
 
         if dry:
             self._log(f"[{index}] DRY RUN — filled, not saving. Returning to list.")
@@ -1054,7 +1056,7 @@ class AutomationWorker(QThread):
             pass
         return best
 
-    def _fill_is_form(self, page: Page, rec) -> None:
+    def _fill_is_form(self, page: Page, rec, account: str = "") -> None:
         for field in config.IS_CLAIM_FIELDS:
             src = field["source"]
             if src == "constant":
@@ -1065,6 +1067,10 @@ class AutomationWorker(QThread):
                 value = self._read_eligible_amount(page)
             else:
                 value = None
+            # The portal rejects an Applicable IS above the Maximum Allowed Claim.
+            # Cap it to the max, submit anyway, and log the anomaly for review.
+            if field["key"] == "applicable_is":
+                value = self._cap_applicable_is(page, account, value)
             try:
                 self._set_field(page, field, value)
             except Exception as e:
@@ -1074,6 +1080,79 @@ class AutomationWorker(QThread):
             if field["key"] == "is_submission_type":
                 page.wait_for_timeout(700)
         self._tick_declaration(page)
+
+    @staticmethod
+    def _to_rupees(value) -> int | None:
+        """Parse a money-ish value ('₹2,325.00', '2496', 2496.0, '1,55,000') to
+        whole rupees (paise dropped). Returns None if it can't be parsed."""
+        if value is None:
+            return None
+        s = re.sub(r"[^\d.]", "", str(value))     # strip ₹, commas, spaces
+        if not s:
+            return None
+        try:
+            return int(float(s))                  # floor positive → drops paise
+        except ValueError:
+            return None
+
+    def _read_max_allowed_claim(self, page: Page) -> str:
+        """Read 'Maximum Allowed Claim' off the form — the cap the portal
+        enforces on Applicable IS. Returns the raw cell text (e.g. '₹2,325.00')
+        or '' if it can't be read."""
+        try:
+            cell = page.locator(config.IS_CLAIM_SELECTORS["max_allowed_claim"]).first
+            cell.wait_for(state="visible", timeout=5000)
+            return cell.inner_text(timeout=4000).strip()
+        except Exception:
+            return ""
+
+    def _cap_applicable_is(self, page: Page, account: str, excel_value) -> str:
+        """If the Excel Applicable IS exceeds the form's Maximum Allowed Claim,
+        return the max (so the portal accepts it) and record the anomaly.
+        Otherwise return the Excel value unchanged."""
+        # Let the form settle so the system-computed max is current before we read.
+        page.wait_for_timeout(400)
+        excel_n = self._to_rupees(excel_value)
+        max_n = self._to_rupees(self._read_max_allowed_claim(page))
+        if excel_n is None or max_n is None or max_n <= 0:
+            # Can't compare reliably — leave the Excel value as-is.
+            return excel_value
+        if excel_n > max_n:
+            self._log(f"     · [WARN] Applicable IS {excel_n} exceeds Maximum Allowed "
+                      f"Claim {max_n} — capping to {max_n} (anomaly logged).")
+            self.anomalies.append({
+                "account_no":   account,
+                "actual_claim": excel_n,
+                "added_claim":  max_n,
+            })
+            return str(max_n)
+        return excel_value
+
+    def _write_anomalies(self) -> None:
+        """Write the capped-record anomalies (account, actual claim, added claim)
+        to an Excel file in logs/ for later review. Falls back to CSV if the
+        Excel engine isn't available so the data is never lost."""
+        if not self.anomalies:
+            return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        cols = ["account_no", "actual_claim", "added_claim"]
+        xlsx = config.LOGS_DIR / f"is_claim_anomalies_{stamp}.xlsx"
+        try:
+            import pandas as pd
+            pd.DataFrame(self.anomalies, columns=cols).to_excel(xlsx, index=False)
+            self._log(f"[INFO] {len(self.anomalies)} capped record(s) saved to "
+                      f"anomalies file: {xlsx.name}")
+        except Exception as e:
+            csv_path = config.LOGS_DIR / f"is_claim_anomalies_{stamp}.csv"
+            try:
+                with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+                    w = csv.DictWriter(fh, fieldnames=cols)
+                    w.writeheader()
+                    w.writerows(self.anomalies)
+                self._log(f"[WARN] Could not write Excel ({e}); saved anomalies as "
+                          f"CSV: {csv_path.name}")
+            except Exception as e2:
+                self._log(f"[ERROR] Could not write anomalies file: {e2}")
 
     def _set_field(self, page: Page, field: dict, value) -> None:
         sel = field["selector"]
@@ -1414,7 +1493,10 @@ class ClaimApproverGUI(QMainWindow):
             "&nbsp;&nbsp;3. It fills the dates and amounts, ticks the "
             "declaration, and submits.<br/>"
             "&nbsp;&nbsp;4. Accounts not found in your file are skipped and "
-            "noted in the Log."
+            "noted in the Log.<br/>"
+            "&nbsp;&nbsp;5. If a claim's Applicable IS is higher than the "
+            "portal's Maximum Allowed Claim, it fills the <b>maximum</b> instead "
+            "and saves those to an anomalies Excel file in the logs folder."
             "<br/><br/>"
             "<span style='color:#a6adc8; font-size:9pt;'>Your Excel file stays "
             "on your computer — it is never uploaded or saved by this tool.</span>"

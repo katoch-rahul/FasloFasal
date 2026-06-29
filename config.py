@@ -114,6 +114,10 @@ IS_CLAIM_SELECTORS = {
     "add_button": 'a:has-text("Add"), button:has-text("Add")',   # on each list row
     "account_no_label": 'text=/Account No\\.?/',                 # header anchor to read account #
     "is_submission_type": 'select[name="priSubmissionType"]',
+    # Read-only cell showing the system's Maximum Allowed Claim — the cap the
+    # portal enforces on Applicable IS (it rejects anything higher on Save with
+    # "Please enter valid Applicable IS amount").
+    "max_allowed_claim": 'td.maxAllowedClaimTD',
     "declaration_checkbox": 'input[name="declarationText"][type="checkbox"]',
     "save_button": 'button:has-text("SAVE & CONTINUE")',
     "submit_button": 'button:has-text("Submit"), button:has-text("SUBMIT")',
