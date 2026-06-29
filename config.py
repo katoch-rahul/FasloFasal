@@ -118,4 +118,11 @@ IS_CLAIM_SELECTORS = {
     "save_button": 'button:has-text("SAVE & CONTINUE")',
     "submit_button": 'button:has-text("Submit"), button:has-text("SUBMIT")',
     "back_button": 'button:has-text("BACK")',
+    # Pop-up dialogs (SweetAlert-style) auto-clicked to finish a live submit:
+    #   Save & Continue -> "saved successfully"      -> OK
+    #   Submit          -> "are you sure ... submit" -> CONFIRM (NOT Cancel)
+    #                   -> "submitted successfully"  -> OK
+    # "Confirm" matching never hits the CANCEL button beside it.
+    "confirm_button": 'button:has-text("CONFIRM"), button:has-text("Confirm"), button:has-text("Yes")',
+    "ok_button": 'button:has-text("OK"), button:has-text("Ok")',
 }

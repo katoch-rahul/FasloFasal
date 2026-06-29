@@ -970,15 +970,41 @@ class AutomationWorker(QThread):
             self._dry_cursor += 1
             return "dry"
 
-        # LIVE: Save & Continue → review → Submit
+        # LIVE: Save & Continue → [OK] → review → Submit → CONFIRM → [OK].
+        # The portal pops a dialog after each step; auto-click straight through.
         page.locator(config.IS_CLAIM_SELECTORS["save_button"]).first.click(
             timeout=self.settings["per_record_timeout"])
-        page.wait_for_timeout(1500)
+        # "Claim application saved successfully." → OK
+        self._click_dialog(page, config.IS_CLAIM_SELECTORS["ok_button"], "OK (saved)")
+        page.wait_for_timeout(800)
+        # Review screen → Submit
         page.locator(config.IS_CLAIM_SELECTORS["submit_button"]).first.click(
             timeout=self.settings["per_record_timeout"])
-        page.wait_for_timeout(2000)
+        # "Are you sure you want to submit this claim application?" → CONFIRM
+        self._click_dialog(page, config.IS_CLAIM_SELECTORS["confirm_button"], "Confirm (submit)")
+        page.wait_for_timeout(800)
+        # "Claim application No. … has been submitted successfully." → OK
+        self._click_dialog(page, config.IS_CLAIM_SELECTORS["ok_button"], "OK (submitted)")
+        page.wait_for_timeout(1800)
         self._log_record(writer, index, "submitted", "", account=account)
         return "filled"
+
+    def _click_dialog(self, page: Page, selector: str, label: str,
+                      timeout_ms: int = 12000) -> bool:
+        """Best-effort click of a pop-up dialog button (e.g. the OK on
+        'saved successfully', or CONFIRM on the submit prompt). Waits briefly
+        for it to appear; a missing dialog is logged but never raises so one
+        absent pop-up can't abort an otherwise-good submission."""
+        try:
+            btn = page.locator(selector).first
+            btn.wait_for(state="visible", timeout=timeout_ms)
+            btn.click(timeout=self.settings["per_record_timeout"])
+            self._log(f"     · clicked {label}")
+            page.wait_for_timeout(400)
+            return True
+        except Exception:
+            self._log(f"     · no {label} dialog appeared (skipped)")
+            return False
 
     def _dump_form_html(self, page: Page) -> None:
         """Save the IS form DOM once per run so selectors can be tuned to the
