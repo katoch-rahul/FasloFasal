@@ -41,6 +41,17 @@ from playwright.sync_api import (
 import config
 
 
+class DateNotSelectable(Exception):
+    """Raised when an Excel date — and every date within the calendar's forward
+    search window — is greyed out in the rmdp picker, so the record can't be
+    filled and must be skipped."""
+
+    def __init__(self, field_label: str, value: str):
+        self.field_label = field_label
+        self.value = value
+        super().__init__(f"{field_label} {value!r} is beyond the selectable range")
+
+
 # ── Stylesheet (compact, modern) ──────────────────────────────────────────────
 APP_STYLE = """
 * { font-family: 'Segoe UI', Arial, sans-serif; }
@@ -963,7 +974,20 @@ class AutomationWorker(QThread):
 
         self._log(f"[{index}] Account {self._mask(account)} matched — filling…")
         self._dump_form_html(page)
-        self._fill_is_form(page, rec, account)
+        try:
+            self._fill_is_form(page, rec, account)
+        except DateNotSelectable as e:
+            self._log(f"[{index}] [WARN] {e.field_label} {e.value} is too far beyond "
+                      f"the calendar's selectable range — skipping account "
+                      f"{self._mask(account)}, moving to the next record.")
+            self._log_record(writer, index, "date_out_of_range",
+                             str(e), account=account)
+            self._is_back_to_list(page)
+            if dry:
+                self._dry_cursor += 1
+            else:
+                self.skipped_accounts.add(account)
+            return "skip"
 
         if dry:
             self._log(f"[{index}] DRY RUN — filled, not saving. Returning to list.")
@@ -1073,6 +1097,10 @@ class AutomationWorker(QThread):
                 value = self._cap_applicable_is(page, account, value)
             try:
                 self._set_field(page, field, value)
+            except DateNotSelectable:
+                # No selectable date in range — bubble up so the caller skips the
+                # whole record rather than saving it with a missing date.
+                raise
             except Exception as e:
                 self._log(f"     · [WARN] couldn't set {field['label']}: {e}")
             # Selecting the submission type enables the downstream fields — give
@@ -1175,7 +1203,7 @@ class AutomationWorker(QThread):
             return
 
         if field["type"] == "date":
-            self._type_date(page, loc, str(value))
+            self._type_date(page, loc, str(value), field["label"])
         else:
             loc.click(timeout=self.settings["per_record_timeout"])
             loc.fill(str(value), timeout=self.settings["per_record_timeout"])
@@ -1184,10 +1212,13 @@ class AutomationWorker(QThread):
     MONTHS = ["january", "february", "march", "april", "may", "june", "july",
               "august", "september", "october", "november", "december"]
 
-    def _type_date(self, page: Page, loc, value: str) -> None:
+    def _type_date(self, page: Page, loc, value: str, field_label: str = "date") -> None:
         """Set an rmdp date by driving its calendar. The input ignores typed and
         programmatic values, so we open the popup, step to the target month/year
-        with the arrows, then click the day cell."""
+        with the arrows, then click the day cell. If the Excel date is greyed out
+        (not selectable), the closest later selectable date is used instead. When
+        no date within the forward search window is selectable, raises
+        DateNotSelectable so the caller can skip the whole record."""
         try:
             dt = datetime.strptime(value, config.IS_CLAIM_DATE_FORMAT)
         except Exception:
@@ -1205,11 +1236,11 @@ class AutomationWorker(QThread):
         except Exception:
             self._log("     · [WARN] calendar did not open")
             return
-        if not self._navigate_calendar_to(page, dt.month, dt.year):
-            self._log(f"     · [WARN] could not reach {dt.month:02d}/{dt.year} in calendar")
+        if not self._select_on_or_after(page, dt):
+            self._log(f"     · [WARN] no selectable date within "
+                      f"{self.DATE_FALLBACK_MONTHS} months of {value} — record will be skipped")
             self._close_calendar(page)
-            return
-        self._click_calendar_day(page, dt.day)
+            raise DateNotSelectable(field_label, value)
         page.wait_for_timeout(150)
         self._close_calendar(page)
 
@@ -1243,20 +1274,66 @@ class AutomationWorker(QThread):
             page.wait_for_timeout(110)
         return False
 
-    def _click_calendar_day(self, page: Page, day: int) -> None:
-        # Exclude days bleeding in from adjacent months (hidden/deactivated).
+    # How many months past the Excel date to keep looking for a selectable day
+    # before giving up — guards against scanning forever if the picker has no
+    # open dates at all.
+    DATE_FALLBACK_MONTHS = 6
+
+    def _select_on_or_after(self, page: Page, target: datetime) -> bool:
+        """Click the Excel date; if the portal greys it out (not selectable),
+        click the closest *later* date that is selectable instead. Walks forward
+        day-by-day, crossing into following months as needed, so a disabled
+        start date snaps to the next available one rather than silently leaving
+        the field blank. Returns True once a day is clicked."""
+        month, year = target.month, target.year
+        for _ in range(self.DATE_FALLBACK_MONTHS + 1):
+            if not self._navigate_calendar_to(page, month, year):
+                self._log(f"     · [WARN] could not reach {month:02d}/{year} in calendar")
+                return False
+            # First month examined: don't accept anything before the Excel day.
+            # Later months: any day is fair game (the 1st onward).
+            floor_day = target.day if (month, year) == (target.month, target.year) else 1
+            picked_day = self._click_first_selectable_from(page, floor_day)
+            if picked_day is not None:
+                picked = datetime(year, month, picked_day)
+                if picked.date() != target.date():
+                    fmt = config.IS_CLAIM_DATE_FORMAT
+                    self._log(f"     · [INFO] {target.strftime(fmt)} not selectable — "
+                              f"using next available {picked.strftime(fmt)}")
+                return True
+            # Nothing selectable on/after floor_day this month → roll to the next.
+            month, year = (1, year + 1) if month == 12 else (month + 1, year)
+        return False
+
+    def _click_first_selectable_from(self, page: Page, floor_day: int):
+        """In the month currently shown, click the earliest selectable day whose
+        number is >= floor_day and return that day number, or None if there is
+        none. Excludes adjacent-month spillover (hidden/deactive) and portal-
+        disabled (greyed 'rmdp-disabled') dates."""
         days = page.locator(
-            ".rmdp-day:not(.rmdp-day-hidden):not(.rmdp-deactive)")
-        target = str(int(day))
-        for i in range(days.count()):
-            d = days.nth(i)
+            ".rmdp-day:not(.rmdp-day-hidden):not(.rmdp-deactive):not(.rmdp-disabled)")
+        best_day, best_idx = None, None
+        try:
+            n = days.count()
+        except Exception:
+            return None
+        for i in range(n):
             try:
-                if d.inner_text(timeout=1500).strip() == target:
-                    d.click(timeout=self.settings["per_record_timeout"])
-                    return
+                txt = days.nth(i).inner_text(timeout=1500).strip()
             except Exception:
                 continue
-        self._log(f"     · [WARN] day {day} not found in calendar grid")
+            if not txt.isdigit():
+                continue
+            d = int(txt)
+            if d >= floor_day and (best_day is None or d < best_day):
+                best_day, best_idx = d, i
+        if best_idx is None:
+            return None
+        try:
+            days.nth(best_idx).click(timeout=self.settings["per_record_timeout"])
+            return best_day
+        except Exception:
+            return None
 
     def _close_calendar(self, page: Page) -> None:
         """Dismiss any open rmdp calendar popup so it can't intercept clicks."""
